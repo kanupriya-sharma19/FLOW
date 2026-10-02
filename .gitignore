@@ -1,0 +1,41 @@
+# Dependencies
+node_modules/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# TypeScript build output
+dist/
+
+# Logs
+*.log
+logs/
+
+# Runtime / temporary files
+*.tmp
+*.temp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
+!.vscode/settings.json
+
+# Test / coverage output
+coverage/
+
+# Local generated files
+retry-test.txt
+test-folder/
+
+# Prisma / database local files (if added later)
+.prisma/
+
+# Misc
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*

@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: flow-postgres
+
+    entrypoint: ["/bin/bash", "/usr/local/bin/docker-entrypoint.sh"]
+    command: ["postgres"]
+
+    environment:
+      POSTGRES_USER: flow
+      POSTGRES_PASSWORD: flow
+      POSTGRES_DB: flow
+
+    ports:
+      - "5432:5432"
+
+    volumes:
+      - flow_postgres_data:/var/lib/postgresql/data
+
+volumes:
+  flow_postgres_data:
