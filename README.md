@@ -1,437 +1,154 @@
-# FLOW - Job Scheduling System
+﻿# FLOW
 
-FLOW is a basic job scheduling system built as a learning-oriented proof of concept (POC).
+FLOW is a distributed job scheduling and execution platform built with Node.js, TypeScript, PostgreSQL, Redis, and BullMQ. It is designed around a simple but practical idea: store job intent in PostgreSQL as the durable source of truth, enqueue execution work through BullMQ/Redis, and have one or more workers perform the actual work outside the web API.
 
-The goal is to understand how a job scheduler works internally:
+This repository is not just a toy scheduler. It implements a concrete system in which jobs can be created through HTTP, scheduled for immediate, one-time, or recurring execution, queued for worker consumption, retried on failure, monitored for worker liveness, and recovered if a worker dies mid-execution.
 
-- Creating jobs
-- Persisting jobs in PostgreSQL
-- Scheduling pending jobs
-- Queuing jobs
-- Picking jobs with a worker
-- Executing real OS commands
-- Tracking job status
-- Handling successful and failed jobs
-- Cancelling jobs
+## Why FLOW exists
 
-Redis, BullMQ, distributed workers, retries, concurrency control, and similar production concerns are intentionally not implemented yet. They will be introduced incrementally after the fundamentals are understood.
+The system solves a straightforward backend engineering problem: how to safely and predictably execute asynchronous work at scale while keeping the system observable and recoverable.
 
----
+In practice, that means:
 
-## 1. Current Architecture
+- API requests create jobs without blocking on execution.
+- Scheduling logic decides when a job becomes eligible to run.
+- Redis/BullMQ moves execution work from the database into a real queue.
+- Workers consume jobs and execute shell commands.
+- PostgreSQL remains the durable state store for job lifecycle and logs.
+- A monitor detects dead workers and requeues recovery work when necessary.
 
-```text
-                              +------------------+
-                              |      Client      |
-                              | Postman / API    |
-                              +---------+--------+
-                                        |
-                                        v
-                              +------------------+
-                              |   Express API    |
-                              |                  |
-                              | Create Job       |
-                              | Get Job          |
-                              | Update Job       |
-                              | Delete Job       |
-                              | Cancel Job       |
-                              +---------+--------+
-                                        |
-                                        v
-                              +------------------+
-                              |   PostgreSQL     |
-                              |                  |
-                              |      jobs        |
-                              |                  |
-                              | PENDING          |
-                              | QUEUED           |
-                              | RUNNING          |
-                              | COMPLETED        |
-                              | FAILED           |
-                              | CANCELLED        |
-                              +---------+--------+
-                                        |
-                  +---------------------+---------------------+
-                  |                                            |
-                  v                                            v
-          +----------------+                         +----------------+
-          |   Scheduler    |                         |    Worker      |
-          |                |                         |                |
-          | PENDING        |                         | QUEUED         |
-          |       v        |                         |       v        |
-          |  QUEUED        |                         |  RUNNING       |
-          +----------------+                         |       v        |
-                                                    | execute()      |
-                                                    |       v        |
-                                                    | COMPLETED /    |
-                                                    | FAILED         |
-                                                    +----------------+
+This separation matters: the API is responsible for receiving requests, but job execution is intentionally decoupled from the web process so that jobs can continue even if request handling or worker processes are restarted independently.
+
+## Key features implemented
+
+The current codebase already includes:
+
+- HTTP job creation, listing, lookup, update, deletion, and cancellation
+- Immediate, one-time, and recurring job scheduling
+- Priority-aware queue ordering
+- PostgreSQL-backed job state and job history
+- BullMQ queue delivery via Redis
+- Multiple worker processes with independent concurrency
+- Worker heartbeats and active monitoring
+- Retry flow with fixed backoff
+- Recurring job next-run scheduling based on cron expressions
+- Crash recovery for jobs assigned to dead workers
+- Job logs for lifecycle events
+
+## High-level architecture
+
+```mermaid
+flowchart LR
+    Client[Client / API Consumer] --> API[Express API\nPOST /jobs\nGET /jobs\nPATCH /jobs/:id]
+    API --> PG[(PostgreSQL\njobs, job_logs, workers)]
+    API --> Scheduler[Scheduler Process]
+    Scheduler --> PG
+    Scheduler --> Queue[Redis + BullMQ\nflow-jobs]
+    Queue --> Worker1[Worker Process 1]
+    Queue --> Worker2[Worker Process 2]
+    Queue --> WorkerN[Worker Process N]
+    Worker1 --> OS[Shell / OS Command]
+    Worker2 --> OS
+    WorkerN --> OS
+    Worker1 --> PG
+    Worker2 --> PG
+    WorkerN --> PG
+    Monitor[Worker Monitor] --> PG
+    Monitor --> Queue
 ```
 
-Currently PostgreSQL acts as both:
+The architecture intentionally separates responsibilities:
 
-1. Persistent storage
-2. Temporary job queue
+- PostgreSQL: durable state
+- BullMQ/Redis: work dispatch and retry coordination
+- Workers: actual command execution
+- Monitor: liveness/recovery checks
+- API: ingress and CRUD operations
 
-Later, Redis/BullMQ can be introduced to handle job distribution more reliably.
+## Components and why they exist
 
----
+| Component | Role | Why it exists |
+|---|---|---|
+| API server | Express app and REST endpoints | Accepts job creation and management requests without doing execution work directly |
+| PostgreSQL | Source of truth for jobs and logs | Keeps state durable, queryable, and auditable |
+| Scheduler | Polls pending jobs and enqueues them | Moves jobs from database state to BullMQ queue |
+| BullMQ + Redis | Queue, retry, and concurrency coordination | Decouples producers from consumers and provides job distribution |
+| Worker process | Executes `job.command` | Isolates execution from HTTP handling and allows horizontal scaling |
+| Worker monitor | Detects dead workers and requeues work | Recovers from crashes without losing job ownership entirely |
 
-## 2. Tech Stack
+## Database and state model
 
-### Backend
+The project initializes PostgreSQL tables in `src/init-db.ts`. The important tables are:
 
-- Node.js
-- TypeScript
-- Express.js
+- `jobs`: current job state
+- `job_logs`: event history for each job
+- `workers`: worker identity, status, and heartbeat timestamps
 
-### Database
+```mermaid
+erDiagram
+    JOBS ||--o{ JOB_LOGS : logs
+    WORKERS ||--o{ JOBS : owns
 
-- PostgreSQL 17
-- `pg` Node.js PostgreSQL client
+    JOBS {
+        UUID id PK
+        VARCHAR name
+        TEXT command
+        INT priority
+        VARCHAR status
+        INT attempts
+        INT max_attempts
+        VARCHAR schedule_type
+        TIMESTAMPTZ scheduled_at
+        TEXT cron_expression
+        TIMESTAMPTZ next_run_at
+        TIMESTAMP created_at
+        TIMESTAMP updated_at
+        TIMESTAMP started_at
+        TIMESTAMP completed_at
+        VARCHAR worker_id
+        TEXT error
+    }
 
-### Development
+    JOB_LOGS {
+        UUID id PK
+        UUID job_id FK
+        VARCHAR event
+        TEXT message
+        TIMESTAMP created_at
+    }
 
-- `tsx`
-- Docker
-- Docker Compose
-- Postman / REST client
-
----
-
-## 3. Project Structure
-
-```text
-FLOW/
-|-- src/
-|   |-- app.ts
-|   |-- server.ts
-|   |-- db.ts
-|   |-- test-db.ts
-|   |-- routes/
-|   |   |-- job.routes.ts
-|   |-- controllers/
-|   |   |-- job.controller.ts
-|   |-- services/
-|       |-- scheduler.service.ts
-|       |-- worker.service.ts
-|-- .env
-|-- package.json
-|-- tsconfig.json
-|-- docker-compose.yml
-|-- README.md
+    WORKERS {
+        UUID id PK
+        VARCHAR worker_id UK
+        VARCHAR status
+        TIMESTAMP last_heartbeat
+        UUID current_job_id
+        TIMESTAMP started_at
+        TIMESTAMP updated_at
+    }
 ```
 
-`test-db.ts` was used during initial database connection testing and can eventually be removed.
+### Key job fields
 
----
+The `jobs` table stores:
 
-## 4. PostgreSQL Setup
+- `status`: `PENDING`, `QUEUED`, `RUNNING`, `COMPLETED`, `FAILED`, `CANCELLED`
+- `schedule_type`: `IMMEDIATE`, `ONCE`, or `RECURRING`
+- `scheduled_at`: when a one-time job should run
+- `cron_expression`: recurring schedule
+- `next_run_at`: next scheduled execution timestamp for recurring jobs
+- `priority`: queue priority value from the API
+- `attempts` and `max_attempts`: current execution count and retry ceiling
+- `worker_id`: last worker that claimed the job
+- `error`: last failure message
 
-PostgreSQL is running inside Docker.
+`job_logs` records the lifecycle events of each job, such as `CREATED`, `QUEUED`, `STARTED`, `COMPLETED`, `FAILED`, `RETRYING`, and `CANCELLED`.
 
-Container:
+## API and request flow
 
-```text
-flow-postgres
-```
+The API is mounted in `src/app.ts` and all job routes are defined in `src/routes/job.routes.ts`.
 
-Image:
-
-```text
-postgres:17
-```
-
-Database:
-
-```text
-flow
-```
-
-Username:
-
-```text
-flow
-```
-
-Password:
-
-```text
-flow
-```
-
-Port:
-
-```text
-5432
-```
-
-The database is available at:
-
-```text
-localhost:5432
-```
-
----
-
-## 5. PostgreSQL Installation Issue
-
-PostgreSQL 18 was also installed natively on Windows.
-
-This caused a port conflict because:
-
-```text
-Windows PostgreSQL -> localhost:5432
-Docker PostgreSQL  -> localhost:5432
-```
-
-Only one process can listen on the same port.
-
-We discovered that the Windows PostgreSQL process was occupying port 5432.
-
-The Windows PostgreSQL service was therefore changed to:
-
-```text
-Startup Type: Manual
-```
-
-and stopped.
-
-This allows Docker PostgreSQL to own port 5432 during development.
-
-pgAdmin can still be used later to connect to the Docker PostgreSQL instance.
-
----
-
-## 6. Environment Variables
-
-The `.env` file currently contains:
-
-```env
-DATABASE_URL="postgresql://flow:flow@localhost:5432/flow"
-PORT=8000
-```
-
-The application uses `DATABASE_URL` to connect to PostgreSQL.
-
----
-
-## 7. Database Connection
-
-The PostgreSQL connection is created using `pg`.
-
-```ts
-import { Pool } from "pg";
-import dotenv from "dotenv";
-
-dotenv.config();
-
-export const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-});
-```
-
-The connection was tested successfully.
-
-Example result:
-
-```text
-Connected to PostgreSQL
-current_user: flow
-current_database: flow
-```
-
----
-
-## 8. Jobs Table
-
-The main table is:
-
-```text
-jobs
-```
-
-Schema:
-
-```sql
-CREATE TABLE IF NOT EXISTS jobs (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  name VARCHAR(255) NOT NULL,
-  command TEXT NOT NULL,
-  priority INT NOT NULL DEFAULT 0,
-  status VARCHAR(30) NOT NULL DEFAULT 'PENDING',
-  attempts INT NOT NULL DEFAULT 0,
-  max_attempts INT NOT NULL DEFAULT 3,
-  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
-  started_at TIMESTAMP,
-  completed_at TIMESTAMP,
-  error TEXT
-);
-```
-
----
-
-## 9. Meaning of Job Fields
-
-### `id`
-
-Unique identifier for the job.
-
-Example:
-
-```text
-550e8400-e29b-41d4-a716-446655440000
-```
-
-### `name`
-
-Human-readable job name.
-
-Example:
-
-```text
-create-folder
-```
-
-### `command`
-
-The actual operating-system command that the worker will execute.
-
-Example:
-
-```text
-echo Hello FLOW
-```
-
-or:
-
-```text
-mkdir test-folder
-```
-
-### `priority`
-
-Determines which queued job should be processed first.
-
-Higher priority is processed first.
-
-Example:
-
-```text
-priority = 10
-```
-
-will be selected before:
-
-```text
-priority = 1
-```
-
-### `status`
-
-Current state of the job.
-
-Possible states currently used:
-
-```text
-PENDING
-QUEUED
-RUNNING
-COMPLETED
-FAILED
-CANCELLED
-```
-
-### `attempts`
-
-Number of execution attempts.
-
-Currently the field exists, but retry logic has not yet been implemented.
-
-### `max_attempts`
-
-Maximum number of attempts allowed.
-
-Currently defaults to:
-
-```text
-3
-```
-
-Retry behavior will be implemented later.
-
-### `created_at`
-
-When the job was created.
-
-### `updated_at`
-
-Last time the job record was updated.
-
-### `started_at`
-
-When the worker started executing the job.
-
-### `completed_at`
-
-When the job completed successfully.
-
-### `error`
-
-Stores the error message when execution fails.
-
----
-
-## 10. Job Lifecycle
-
-The current job lifecycle is:
-
-```text
-PENDING
-  |
-  v
-QUEUED
-  |
-  v
-RUNNING
-  |
-  +------------------> COMPLETED
-  |
-  +------------------> FAILED
-```
-
-Cancellation is possible before execution:
-
-```text
-PENDING --------> CANCELLED
-QUEUED ---------> CANCELLED
-```
-
-The API does not directly control execution states such as:
-
-```text
-RUNNING
-COMPLETED
-FAILED
-```
-
-Those states are controlled by the scheduler and worker.
-
----
-
-## 11. Express Application
-
-`app.ts` creates the Express application.
-
-```ts
-const app = express();
-
-app.use(cors());
-app.use(express.json());
-```
-
-A health endpoint exists:
+### Health
 
 ```http
 GET /health
@@ -446,760 +163,543 @@ Response:
 }
 ```
 
-Job routes are mounted under:
+### Job endpoints
 
-```text
-/jobs
+| Method | Route | Purpose |
+|---|---|---|
+| `GET` | `/health` | API readiness check |
+| `POST` | `/jobs` | Create a new job |
+| `GET` | `/jobs` | List all jobs |
+| `GET` | `/jobs/:id` | Get one job |
+| `PATCH` | `/jobs/:id` | Update name, command, priority, maxAttempts |
+| `DELETE` | `/jobs/:id` | Delete a job row |
+| `POST` | `/jobs/:id/cancel` | Cancel `PENDING` or `QUEUED` jobs |
+| `POST` | `/jobs/queue` | Trigger scheduler-style queueing immediately |
+
+### Example job creation
+
+```bash
+curl -X POST http://localhost:8000/jobs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "daily-report",
+    "command": "echo \"daily report\"",
+    "priority": 10,
+    "scheduleType": "IMMEDIATE",
+    "maxAttempts": 3
+  }'
 ```
 
----
-
-## 12. API Endpoints
-
-### Create Job
-
-```http
-POST /jobs
-```
-
-Example body:
+Example response shape:
 
 ```json
 {
-  "name": "hello-job",
-  "command": "echo Hello FLOW",
-  "priority": 1,
-  "maxAttempts": 3
+  "id": "5ee0f208-2af2-4d04-9b52-c32d6ab0ccef",
+  "name": "daily-report",
+  "command": "echo \"daily report\"",
+  "priority": 10,
+  "status": "PENDING",
+  "attempts": 0,
+  "max_attempts": 3,
+  "schedule_type": "IMMEDIATE",
+  "scheduled_at": null,
+  "cron_expression": null,
+  "next_run_at": null,
+  "created_at": "2026-10-03T12:00:00.000Z",
+  "updated_at": "2026-10-03T12:00:00.000Z"
 }
 ```
 
-New jobs start with:
+### Request validation
 
-```text
-PENDING
+`createJob` validates:
+
+- presence of `name` and `command`
+- valid `scheduleType` (`IMMEDIATE`, `ONCE`, `RECURRING`)
+- `scheduledAt` for `ONCE` jobs
+- `cronExpression` for `RECURRING` jobs
+- timezone-aware or local timestamp support for `scheduledAt`
+
+## Job types and scheduling semantics
+
+### Immediate jobs
+
+`IMMEDIATE` is the default schedule type. The scheduler treats these as eligible as soon as they are created.
+
+### One-time jobs
+
+`ONCE` requires a `scheduledAt` field. The scheduler enqueues the job only when:
+
+- `schedule_type = 'ONCE'`
+- `scheduled_at <= NOW()`
+
+The database stores timestamps in PostgreSQL as `TIMESTAMPTZ` and does a timezone normalization step during schema initialization.
+
+### Recurring jobs
+
+`RECURRING` requires a valid `cronExpression`. The code calculates an initial `next_run_at` using `cron-parser` and then advances it after each successful execution.
+
+```mermaid
+sequenceDiagram
+    participant API as API
+    participant DB as PostgreSQL
+    participant Scheduler as Scheduler
+    participant Queue as BullMQ / Redis
+    participant Worker as Worker
+
+    API->>DB: INSERT jobs (schedule_type='RECURRING', cron_expression, next_run_at)
+    Scheduler->>DB: Poll jobs where next_run_at <= NOW()
+    Scheduler->>DB: status = QUEUED
+    Scheduler->>Queue: add execute-job
+    Queue-->>Worker: dispatch job
+    Worker->>DB: UPDATE status = RUNNING
+    Worker->>Worker: exec(job.command)
+    alt success
+        Worker->>DB: status = PENDING, next_run_at = next execution timestamp
+        Worker->>DB: INSERT job_logs (COMPLETED)
+    else fail
+        Worker->>DB: status = QUEUED or FAILED
+        Worker-->>Queue: throw error so BullMQ can retry
+    end
 ```
 
-### Get All Jobs
+## Scheduler and queue flow
 
-```http
-GET /jobs
-```
+The scheduler process runs `src/scheduler.ts`, which calls `startScheduler()` from `src/services/scheduler.service.ts`.
 
-Returns all jobs ordered by creation time.
-
-### Get One Job
-
-```http
-GET /jobs/:id
-```
-
-Example:
-
-```http
-GET /jobs/550e8400-e29b-41d4-a716-446655440000
-```
-
-### Update Job
-
-```http
-PATCH /jobs/:id
-```
-
-Currently metadata can be updated:
-
-- name
-- command
-- priority
-- maxAttempts
-
-The API intentionally does not allow directly changing execution status.
-
-For example, clients should not be able to do:
-
-```json
-{
-  "status": "COMPLETED"
-}
-```
-
-The worker is responsible for execution state.
-
-### Delete Job
-
-```http
-DELETE /jobs/:id
-```
-
-Deletes the job from PostgreSQL.
-
-### Cancel Job
-
-```http
-POST /jobs/:id/cancel
-```
-
-A job can be cancelled when it is:
-
-```text
-PENDING
-```
-
-or:
-
-```text
-QUEUED
-```
-
-A running or completed job cannot simply be cancelled through this endpoint.
-
----
-
-## 13. Scheduler
-
-The scheduler is implemented in:
-
-```text
-src/services/scheduler.service.ts
-```
-
-The scheduler periodically checks PostgreSQL.
-
-Current behavior:
-
-```text
-Every 5 seconds
-      v
-Find PENDING jobs
-      v
-Change them to QUEUED
-```
-
-The main query is:
+It polls every 5 seconds and applies this logic:
 
 ```sql
 UPDATE jobs
-SET
-  status = 'QUEUED',
-  updated_at = NOW()
+SET status = 'QUEUED', updated_at = NOW()
 WHERE status = 'PENDING'
+  AND (
+    schedule_type = 'IMMEDIATE'
+    OR (schedule_type = 'ONCE' AND scheduled_at <= NOW())
+    OR (schedule_type = 'RECURRING' AND next_run_at <= NOW())
+  )
 RETURNING *;
 ```
 
-Therefore:
+After the job is selected for queueing, the scheduler adds a BullMQ job to the `flow-jobs` queue using the `jobQueue.add()` call.
 
-```text
-PENDING -> QUEUED
+### Queue implementation
+
+`src/queues/job.queue.ts` creates:
+
+```ts
+export const connection = new Redis(process.env.REDIS_URL || "redis://localhost:6379", {
+  maxRetriesPerRequest: null,
+});
+
+export const jobQueue = new Queue("flow-jobs", { connection });
 ```
 
-The scheduler currently queues all pending jobs.
+The queue uses the `flow-jobs` queue name and the Redis connection defined by `REDIS_URL`.
 
-This is intentionally simple for the POC.
+## BullMQ execution IDs and `getBullMQExecutionId()`
 
----
+The project gives every BullMQ job an execution-specific identifier. This is implemented in `getBullMQExecutionId()`.
 
-## 14. Worker
+```ts
+export const getBullMQExecutionId = (job: {
+  id: string;
+  schedule_type: string;
+  next_run_at: Date | string | null;
+}) => {
+  if (job.schedule_type !== "RECURRING") {
+    return job.id;
+  }
 
-The worker is implemented in:
+  if (job.next_run_at === null) {
+    throw new Error(`Recurring job ${job.id} has no next_run_at`);
+  }
 
-```text
-src/services/worker.service.ts
+  const nextRunAt =
+    job.next_run_at instanceof Date
+      ? job.next_run_at
+      : new Date(job.next_run_at);
+
+  const executionTimestamp = nextRunAt.getTime();
+  return `${job.id}-${executionTimestamp}`;
+};
 ```
 
-The worker checks PostgreSQL every 2 seconds.
+Why this exists:
 
-Its flow is:
+- A recurring job has many future executions but only one durable database row.
+- The same recurring job should not be re-enqueued with the same BullMQ job ID during scheduler retries.
+- The execution ID includes the `next_run_at` timestamp, so each scheduled occurrence has a distinct BullMQ identity while still being tied to the same logical job row.
+- This is important when the scheduler re-evaluates the same recurring job later and wants to avoid creating duplicate queue entries for the same scheduled occurrence.
 
-```text
-Find QUEUED job
-      v
-Select highest priority
-      v
-Mark RUNNING
-      v
-Execute command
-      v
-Success?
-   /       Yes      No
-  v        v
-COMPLETED  FAILED
+In short, the database row represents the job definition, while the BullMQ execution ID represents a concrete execution at a specific time.
+
+## Job lifecycle from creation to completion
+
+```mermaid
+flowchart TD
+    A[Create Job via API] --> B[INSERT into jobs + job_logs]
+    B --> C[status = PENDING]
+    C --> D[Scheduler polls every 5s]
+    D --> E[status = QUEUED]
+    E --> F[Add BullMQ job to flow-jobs]
+    F --> G[Worker picks job]
+    G --> H[status = RUNNING\nattempts = attempts + 1]
+    H --> I[Execute job.command]
+    I --> J{Command succeeded?}
+    J -- Yes --> K[Recurring?]
+    K -- Yes --> L[status = PENDING\nnext_run_at = next cron occurrence]
+    K -- No --> M[status = COMPLETED]
+    J -- No --> N{attempts < max_attempts?}
+    N -- Yes --> O[status = QUEUED\nBullMQ retry with backoff]
+    N -- No --> P[status = FAILED]
 ```
 
----
+## Retry and backoff behavior
 
-## 15. Selecting a Job
+The retry logic is split between PostgreSQL state and BullMQ behavior.
 
-The worker currently uses:
+When a worker catches a command failure in `src/services/job_processor.service.ts`, it:
 
-```sql
-SELECT *
-FROM jobs
-WHERE status = 'QUEUED'
-ORDER BY priority DESC, created_at ASC
-LIMIT 1;
+1. Inserts a `FAILED` log entry with the execution error
+2. Checks whether `job.attempts < job.max_attempts`
+3. Updates the database to `QUEUED` and clears the worker assignment
+4. Re-throws the error so BullMQ can complete its retry policy
+
+BullMQ is configured with:
+
+```ts
+attempts: job.max_attempts,
+backoff: {
+  type: "fixed",
+  delay: 2000,
+},
+removeOnComplete: true,
 ```
 
 This means:
 
-1. Higher priority jobs are selected first.
-2. If priority is equal, older jobs are selected first.
+- the PostgreSQL job row tracks the logical retry state
+- BullMQ decides when to retry based on the configured attempts and fixed backoff
+- the worker leaves the job in `QUEUED` for the scheduler to pick it again after the worker fails and the queue replays it
 
-Example:
+### Retry flow
 
-```text
-Job A -> priority 1
-Job B -> priority 10
-Job C -> priority 5
+```mermaid
+flowchart LR
+    A[Worker runs command] --> B{Command succeeds?}
+    B -- No --> C[Update job error + logs]
+    C --> D{Current attempts < max_attempts?}
+    D -- Yes --> E[status = QUEUED]
+    E --> F[BullMQ retry after 2s fixed backoff]
+    F --> G[Worker picks job again]
+    D -- No --> H[status = FAILED]
 ```
 
-The worker will select:
+## Worker execution model
 
-```text
-Job B
-```
-
-first.
-
----
-
-## 16. Running a Job
-
-After selecting a job, the worker changes:
-
-```text
-QUEUED -> RUNNING
-```
-
-It also records:
-
-```text
-started_at
-```
-
-Then it executes:
+Worker startup is in `src/worker.ts`. The worker starts a BullMQ `Worker` with a configurable concurrency of 3:
 
 ```ts
-exec(job.command)
+const worker = new Worker(
+  "flow-jobs",
+  async (job) => {
+    await processJob(job);
+  },
+  {
+    connection,
+    concurrency: 3,
+    stalledInterval: 5000,
+    maxStalledCount: 3,
+  },
+);
 ```
 
-Node's `child_process.exec()` sends the command to the operating system.
+This means each Node process can handle up to three jobs concurrently. Multiple worker processes can run independently, allowing the same queue to be processed across more than one machine or container.
 
----
+### Worker execution details
 
-## 17. Real Command Execution
+When a job is picked up, the worker:
 
-This is an important part of FLOW.
+1. Reads the job from PostgreSQL using `job.data.jobId`
+2. Checks whether the job has been cancelled
+3. Marks the job `RUNNING`
+4. Increments `attempts`
+5. Executes `child_process.exec(job.command)`
+6. Updates success/failure state in PostgreSQL
+7. Re-throws on failure so BullMQ handles the retry backoff
 
-The worker is not just pretending to execute commands.
+## Worker heartbeat and monitoring
 
-For example, if a job contains:
+Each worker gets a unique ID using the host name plus a UUID fragment. It registers itself in PostgreSQL and updates a `last_heartbeat` every 5 seconds.
 
-```json
-{
-  "name": "create-folder",
-  "command": "mkdir test-folder"
-}
+```ts
+export const startHeartbeat = () => {
+  setInterval(async () => {
+    await pool.query(
+      `
+      UPDATE workers
+      SET last_heartbeat = NOW(), status = 'ONLINE', updated_at = NOW()
+      WHERE worker_id = $1
+      `,
+      [workerId],
+    );
+  }, 5000);
+};
 ```
 
-then the worker actually executes:
+The monitor runs separately via `src/monitor.ts` and `src/services/worker_monitor.service.ts`. It marks workers offline if they fail to heartbeat within 15 seconds.
+
+```mermaid
+flowchart TD
+    A[Worker heartbeat every 5s] --> B[Update workers.last_heartbeat]
+    C[Monitor every 5s] --> D{Has heartbeat expired > 15s?}
+    D -- Yes --> E[Mark worker OFFLINE]
+    E --> F[Recover jobs WHERE status='RUNNING' AND worker_id = deadWorker]
+    F --> G{Does BullMQ still own the job?}
+    G -- Yes --> H[Do nothing; rely on BullMQ recovery]
+    G -- No --> I[Requeue job or mark FAILED if attempts exhausted]
+```
+
+This is the project’s crash-recovery mechanism. If a worker disappears while holding a running job, the monitor detects the stale worker and requeues the work if necessary.
+
+## Job logs and execution state
+
+The worker logs each stage of execution. The logs are written to the `job_logs` table with events like:
+
+- `CREATED`
+- `QUEUED`
+- `STARTED`
+- `RETRYING`
+- `COMPLETED`
+- `FAILED`
+- `CANCELLED`
+
+The database row itself is the durable state machine. For example:
+
+- `PENDING` means the job has been created but not yet eligible to queue
+- `QUEUED` means the scheduler has moved it into the BullMQ-ready state
+- `RUNNING` means a worker claimed it and is executing `job.command`
+- `COMPLETED` means execution succeeded
+- `FAILED` means maximum retry attempts were exhausted
+- `CANCELLED` means the job was cancelled before execution or while still waiting in the queue
+
+## Project structure
+
+```text
+FLOW/
+├── Dockerfile
+├── docker-compose.yml
+├── .env
+├── package.json
+├── tsconfig.json
+├── src/
+│   ├── app.ts
+│   ├── db.ts
+│   ├── init-db.ts
+│   ├── monitor.ts
+│   ├── scheduler.ts
+│   ├── server.ts
+│   ├── worker.ts
+│   ├── controllers/
+│   │   └── job.controller.ts
+│   ├── queues/
+│   │   └── job.queue.ts
+│   ├── routes/
+│   │   └── job.routes.ts
+│   └── services/
+│       ├── cron.service.ts
+│       ├── job_processor.service.ts
+│       ├── scheduler.service.ts
+│       ├── worker.service.ts
+│       ├── worker_heartbeat.service.ts
+│       └── worker_monitor.service.ts
+├── dist/
+├── node_modules/
+├── package-lock.json
+└── README.md
+```
+
+## Docker and local runtime
+
+### Start the infrastructure with Docker Compose
 
 ```bash
-mkdir test-folder
+docker compose up -d --build
 ```
 
-on the machine running the worker.
+This starts:
 
-So FLOW can perform real operating-system operations.
+- PostgreSQL on `localhost:5432`
+- Redis on `localhost:6379`
+- API on `localhost:8000`
+- Scheduler process
+- Worker process
+- Monitor process
 
-Another example:
+### Local development commands
 
-```json
-{
-  "name": "hello-job",
-  "command": "echo Hello FLOW"
-}
-```
-
-The worker executes:
+Install dependencies:
 
 ```bash
-echo Hello FLOW
+npm install
 ```
 
-and receives:
-
-```text
-Hello FLOW
-```
-
-as stdout.
-
----
-
-## 18. Successful Execution
-
-If the operating system successfully executes the command:
-
-```text
-RUNNING
-  v
-COMPLETED
-```
-
-The worker updates:
-
-```text
-completed_at
-updated_at
-```
-
-and logs the job completion.
-
----
-
-## 19. Failed Execution
-
-The worker does not know beforehand whether a command is valid.
-
-For example:
-
-```text
-this-command-does-not-exist
-```
-
-The worker passes it to the operating system.
-
-If execution fails, `exec()` rejects or throws an error.
-
-The worker catches it and changes:
-
-```text
-RUNNING
-  v
-FAILED
-```
-
-The error message is stored in:
-
-```text
-error
-```
-
----
-
-## 20. stdout and stderr
-
-The worker receives:
-
-```text
-stdout
-stderr
-```
-
-from the command.
-
-### `stdout`
-
-Normal output.
-
-Example:
+Initialize the PostgreSQL schema:
 
 ```bash
-echo Hello
+npm run db:init
 ```
 
-produces:
-
-```text
-Hello
-```
-
-in stdout.
-
-### `stderr`
-
-Error or warning output.
-
-Important:
-
-`stderr` by itself does not necessarily mean the command failed.
-
-The current worker uses whether `exec()` rejects as the primary indication of execution failure.
-
----
-
-## 21. Starting the Application
-
-Development mode:
+Start the API in watch mode:
 
 ```bash
 npm run dev
 ```
 
-This runs:
+Start the scheduler:
 
-```text
-tsx watch src/server.ts
+```bash
+npm run scheduler
 ```
 
-and automatically restarts when source files change.
+Start the worker:
 
----
+```bash
+npm run worker
+```
 
-## 22. Build
+Start the monitor:
 
-To compile TypeScript:
+```bash
+npm run monitor
+```
+
+Build production JS:
 
 ```bash
 npm run build
 ```
 
-This uses:
-
-```text
-tsc
-```
-
-and generates compiled JavaScript according to the TypeScript configuration.
-
----
-
-## 23. Production-Style Start
-
-After building:
+Run the compiled API server:
 
 ```bash
 npm start
 ```
 
-This runs the compiled JavaScript:
+## Environment variables
 
-```text
-node dist/server.js
+The project relies on the following environment values:
+
+| Variable | Purpose | Typical value |
+|---|---|---|
+| `DATABASE_URL` | PostgreSQL connection string for the API, scheduler, worker, and monitor | `postgresql://flow:flow@localhost:5432/flow` |
+| `REDIS_URL` | Redis connection string for BullMQ | `redis://localhost:6379` |
+| `PORT` | API port | `8000` |
+| `WORKER_ID` | Optional explicit worker identity | Hostname + UUID suffix |
+
+The `.env` file used locally looks like this:
+
+```env
+DATABASE_URL="postgresql://flow:flow@localhost:5432/flow"
+PORT=8000
+REDIS_URL=redis://localhost:6379
 ```
 
----
+Docker Compose injects the same service values for the containerized environment, using the Redis service name `redis` and PostgreSQL service name `postgres` instead of `localhost`.
 
-## 24. Current Server Startup
+## Design decisions and tradeoffs
 
-When the server starts:
+### PostgreSQL as the authoritative state store
 
-```text
-FLOW API running on port 8000
-Scheduler started
-Worker started
+The implementation keeps a durable, queryable record of each job in PostgreSQL rather than relying on Redis alone. This makes failure analysis and operational inspection easier.
+
+### Redis/BullMQ for actual work distribution
+
+BullMQ is used as the queue transport. This gives the project real work distribution semantics without having to build a custom queue scheduler from scratch.
+
+### Scheduler polling instead of event-driven scheduling
+
+The scheduler runs a `setInterval` every 5 seconds and checks for ready jobs. This is a simple and effective pattern for a proof-of-concept system, but it is not as event-driven or low-latency as a production scheduler using more advanced queue orchestration.
+
+### Worker concurrency per process
+
+Each worker process runs with `concurrency: 3`, which allows multiple jobs to execute in parallel inside a single worker instance while still keeping the system simple. This is enough to demonstrate scale-out behavior without introducing more explicit resource quotas or orchestration policies.
+
+### Process-level command execution
+
+The actual task command is executed with Node's `child_process.exec()`. This is simple and direct, but it is also a trust boundary. The implementation is intentionally not hardened against arbitrary command injection or untrusted job definitions.
+
+## Failure scenarios and current handling
+
+### Job fails once
+
+The worker catches the command failure, writes to `job_logs`, marks the job as `QUEUED` if retries remain, and rethrows the error so BullMQ can handle the retry.
+
+### Worker crashes mid-job
+
+The worker monitor checks heartbeats. If the worker stops heartbeating, the monitor marks it offline and inspects the jobs it was running. If BullMQ still owns the job, it leaves it alone; otherwise it requeues the job or marks it failed if retries are exhausted.
+
+### Job is cancelled while pending or queued
+
+`POST /jobs/:id/cancel` marks the PostgreSQL row as `CANCELLED` and removes the BullMQ job if it exists.
+
+### Recurring job needs a new schedule
+
+On successful completion, the recurring job is reset to `PENDING` and `next_run_at` is advanced by `calculateNextRun()`, using the cron spec and the current time.
+
+### A job exhausts its retries
+
+The worker updates the job to `FAILED` and stores the last error in `error`.
+
+## Future improvements
+
+The current codebase is a solid foundation, but several production-grade improvements are still missing or intentionally simple:
+
+- stronger job idempotency and deduplication keys
+- result payload storage for completed work
+- explicit job timeout and cancellation of stuck shell commands
+- dead-letter queue handling for permanently failed jobs
+- richer job dependency and fan-out orchestration
+- queue rate limits / concurrency quotas per job type
+- dashboard or admin UI for jobs and worker health
+- authentication, authorization, and role-based API access
+- multi-node deployment orchestration, container scheduling, and observability
+- retry policies that vary per job type instead of one fixed backoff configuration
+
+## Practical summary
+
+FLOW is a working example of a job-scheduler architecture where:
+
+- the API creates durable job records;
+- the scheduler decides which jobs are ready;
+- Redis/BullMQ picks up the ready work and dispatches it;
+- multiple workers do the actual execution;
+- PostgreSQL is the durable truth for lifecycle and logs;
+- the monitor protects the system from dead-worker conditions.
+
+It is intentionally simple, but it demonstrates the core building blocks of a serious backend scheduling platform rather than a purely academic mockup.
+
+## Running the system
+
+```bash
+docker compose up -d --build
+npm run db:init
+npm run dev
+npm run scheduler
+npm run worker
+npm run monitor
 ```
 
-The server starts:
-
-```text
-Express API
-Scheduler
-Worker
-```
-
-all within the current application.
-
----
-
-## 25. Example Complete Flow
-
-Suppose we create:
-
-```json
-{
-  "name": "create-folder",
-  "command": "mkdir test-folder"
-}
-```
-
-The flow becomes:
-
-```text
-POST /jobs
-      |
-      v
-PostgreSQL
-      |
-      v
-PENDING
-      |
-      | Scheduler
-      v
-QUEUED
-      |
-      | Worker
-      v
-RUNNING
-      |
-      | exec("mkdir test-folder")
-      v
-Operating System
-      |
-      v
-Folder created
-      |
-      v
-COMPLETED
-```
-
-The folder is actually created on the machine running FLOW.
-
----
-
-## 26. Why PostgreSQL Is Currently the Queue
-
-For this POC, we intentionally avoided Redis/BullMQ.
-
-PostgreSQL currently handles:
-
-```text
-Persistent storage
-      +
-Basic queue
-```
-
-The worker asks PostgreSQL:
-
-```text
-"Do you have a QUEUED job?"
-```
-
-If one exists, it processes it.
-
-This is useful for understanding the basic architecture before introducing a dedicated queue.
-
----
-
-## 27. Current Limitations
-
-This is a learning POC, so several production concerns are intentionally not solved yet.
-
-### 1. PostgreSQL polling
-
-The worker repeatedly queries PostgreSQL instead of using a dedicated queue.
-
-### 2. No retry mechanism
-
-`attempts` and `max_attempts` exist in the database, but retry behavior has not yet been implemented.
-
-### 3. Basic concurrency
-
-The current worker is effectively a single simple polling worker.
-
-Multiple workers could potentially pick the same job because there is no database locking mechanism yet.
-
-### 4. Scheduler queues everything
-
-The scheduler currently changes all:
-
-```text
-PENDING -> QUEUED
-```
-
-without batching or more advanced scheduling rules.
-
-### 5. No job timeout
-
-A command that runs for a very long time can keep the worker busy.
-
-### 6. No sandboxing
-
-The worker executes shell commands directly on the machine.
+Then interact with the API at `http://localhost:8000`.
 
 For example:
 
-```text
-mkdir test-folder
+```bash
+curl http://localhost:8000/health
+curl http://localhost:8000/jobs
 ```
-
-actually changes the filesystem.
-
-Therefore the current API must only be used with trusted commands.
-
-### 7. No distributed workers
-
-Everything currently runs inside the same application process.
-
----
-
-## 28. Important Security Warning
-
-This part is extremely important.
-
-The current worker executes:
-
-```ts
-exec(job.command)
-```
-
-Therefore, if an untrusted user can submit arbitrary commands, they could potentially execute arbitrary operating-system commands.
-
-For example, this is not safe for a public API.
-
-The current implementation should therefore be treated as:
-
-```text
-LOCAL LEARNING POC
-```
-
-and not as a production job execution system.
-
-A production version would require isolation, authentication, authorization, sandboxing/containers, resource limits, timeouts, and other security controls.
-
----
-
-## 29. What We Have Learned So Far
-
-The current POC demonstrates the fundamental job execution lifecycle:
-
-```text
-Create
-  v
-Persist
-  v
-Schedule
-  v
-Queue
-  v
-Pick
-  v
-Run
-  v
-Complete / Fail
-```
-
-We have also separated responsibilities:
-
-### API
-
-Responsible for:
-
-```text
-Create
-Read
-Update metadata
-Delete
-Cancel
-```
-
-### Scheduler
-
-Responsible for:
-
-```text
-PENDING -> QUEUED
-```
-
-### Worker
-
-Responsible for:
-
-```text
-QUEUED -> RUNNING
-RUNNING -> COMPLETED
-RUNNING -> FAILED
-FAILED -> QUEUED (when retry is available)
-```
-
-### PostgreSQL
-
-Responsible for:
-
-```text
-Persistent job state
-```
-
-and currently also:
-
-```text
-Temporary queue
-```
-
----
-
-## 30. Planned Next Steps
-
-The next improvements can be introduced one at a time.
-
-Possible progression:
-
-```text
-Current POC
-    |
-    v
-Retry mechanism
-    |
-    v
-Job timeout
-    |
-    v
-Concurrency control
-    |
-    v
-Multiple workers
-    |
-    v
-Redis
-    |
-    v
-BullMQ
-    |
-    v
-Reliable distributed job processing
-```
-
-The goal is to understand why each component is needed rather than adding technologies without understanding their purpose.
-
----
-
-## 31. Current Status
-
-### Completed
-
-- [x] Node.js + TypeScript project
-- [x] Express server
-- [x] PostgreSQL Docker setup
-- [x] Database connection using `pg`
-- [x] Jobs table
-- [x] Job creation
-- [x] Get all jobs
-- [x] Get individual job
-- [x] Update job metadata
-- [x] Delete job
-- [x] Cancel job
-- [x] Job status lifecycle
-- [x] Scheduler
-- [x] PENDING -> QUEUED
-- [x] Worker
-- [x] QUEUED -> RUNNING
-- [x] Real command execution
-- [x] RUNNING -> COMPLETED
-- [x] RUNNING -> FAILED
-- [x] Error storage
-- [x] Priority-based job selection
-
-### Not implemented yet
-
-- [ ] Retries
-- [ ] Timeouts
-- [ ] Concurrency control
-- [ ] Multiple workers
-- [ ] Redis
-- [ ] BullMQ
-- [ ] Distributed processing
-- [ ] Worker isolation
-- [ ] Authentication/authorization
-- [ ] Production-grade security
-- [ ] Monitoring
-- [ ] Dead-letter queue
-- [ ] Job dependencies
-
----
 
 ## Final note
 
-The current implementation is intentionally simple.
-
-The main purpose of this project is to understand how a job scheduling system works internally before introducing production-grade components such as Redis, BullMQ, distributed workers, and job execution isolation.
-
-This README reflects exactly where FLOW is right now, including the fact that the worker can actually execute `mkdir test-folder` on your machine.
+This README is based on the actual implementation in the repository. The project is a real operating job system with a PostgreSQL-backed state machine, Redis/BullMQ queueing, worker execution, retries, and monitoring rather than a hypothetical design document.

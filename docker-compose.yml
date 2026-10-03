@@ -115,4 +115,7 @@ services:
 # =========================================
 volumes:
   flow_postgres_data:
+    name: poc_flow_postgres_data
+
   flow_redis_data:
+    name: poc_flow_redis_data

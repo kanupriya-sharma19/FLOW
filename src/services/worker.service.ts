@@ -74,10 +74,6 @@ export const startWorker = async ()  => {
     "flow-jobs",
 
     async (job) => {
-      console.log("Received BullMQ job:", {
-        bullmqJobId: job.id,
-        postgresJobId: job.data.jobId,
-      });
 
       await processJob(job);
     },

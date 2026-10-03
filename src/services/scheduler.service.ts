@@ -48,18 +48,6 @@ export const queuePendingJobs = async () => {
   );
   const jobs = [...jobsById.values()];
 
-  console.log(
-    "Jobs ready for queue:",
-    jobs.map((job) => ({
-      id: job.id,
-      name: job.name,
-      status: job.status,
-      scheduleType: job.schedule_type,
-      nextRunAt: job.next_run_at,
-      scheduledAt: job.scheduled_at,
-    })),
-  );
-
   for (let index = 0; index < jobs.length; index += 1) {
     const job = jobs[index]!;
 
@@ -69,12 +57,6 @@ export const queuePendingJobs = async () => {
 
       if (existingBullJob) {
         const state = await existingBullJob.getState();
-
-        console.log("Existing BullMQ job:", {
-          bullmqJobId,
-          postgresJobId: job.id,
-          state,
-        });
 
         if (state === "completed") {
           await existingBullJob.remove();
@@ -122,11 +104,6 @@ export const queuePendingJobs = async () => {
           removeOnComplete: true,
         },
       );
-
-      console.log("Added BullMQ job:", {
-        bullmqJobId: bullJob.id,
-        postgresJobId: job.id,
-      });
     } catch (error) {
       const notEnqueuedJobIds = jobs
         .slice(index)
@@ -161,15 +138,11 @@ export const startScheduler = () => {
   console.log("Scheduler started");
 
   setInterval(async () => {
-    console.log("Checking scheduled jobs...");
-
     try {
       const jobs = await queuePendingJobs();
 
       if (jobs.length > 0) {
-        console.log(
-          `PostgreSQL marked ${jobs.length} job(s) QUEUED`,
-        );
+        console.log(`PostgreSQL marked ${jobs.length} job(s) QUEUED`);
       }
     } catch (error) {
       console.error("Scheduler error:", error);
