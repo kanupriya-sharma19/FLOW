@@ -1,4 +1,5 @@
 import { pool } from "../db.js";
+import { getBullMQExecutionId, jobQueue } from "../queues/job.queue.js";
 
 export const queuePendingJobs = async () => {
   const result = await pool.query(
@@ -8,18 +9,148 @@ export const queuePendingJobs = async () => {
       status = 'QUEUED',
       updated_at = NOW()
     WHERE status = 'PENDING'
+    AND (
+        schedule_type = 'IMMEDIATE'
+
+        OR
+
+        (
+            schedule_type = 'ONCE'
+            AND scheduled_at <= NOW()
+        )
+
+        OR
+
+        (
+            schedule_type = 'RECURRING'
+            AND next_run_at <= NOW()
+        )
+    )
     RETURNING *
-    `
+    `,
   );
 
-  // Create a log for every job that was queued.
-  for (const job of result.rows) {
+  const queuedResult = await pool.query(
+    `
+    SELECT *
+    FROM jobs
+    WHERE status = 'QUEUED'
+      AND (
+        schedule_type = 'IMMEDIATE'
+        OR (schedule_type = 'ONCE' AND scheduled_at <= NOW())
+        OR (schedule_type = 'RECURRING' AND next_run_at <= NOW())
+      )
+    `,
+  );
+
+  const jobsById = new Map(
+    [...result.rows, ...queuedResult.rows].map((job) => [job.id, job]),
+  );
+  const jobs = [...jobsById.values()];
+
+  console.log(
+    "Jobs ready for queue:",
+    jobs.map((job) => ({
+      id: job.id,
+      name: job.name,
+      status: job.status,
+      scheduleType: job.schedule_type,
+      nextRunAt: job.next_run_at,
+      scheduledAt: job.scheduled_at,
+    })),
+  );
+
+  for (let index = 0; index < jobs.length; index += 1) {
+    const job = jobs[index]!;
+
+    try {
+      const bullmqJobId = getBullMQExecutionId(job);
+      const existingBullJob = await jobQueue.getJob(bullmqJobId);
+
+      if (existingBullJob) {
+        const state = await existingBullJob.getState();
+
+        console.log("Existing BullMQ job:", {
+          bullmqJobId,
+          postgresJobId: job.id,
+          state,
+        });
+
+        if (state === "completed") {
+          await existingBullJob.remove();
+        } else if (state === "failed") {
+          await pool.query(
+            `
+            UPDATE jobs
+            SET status = 'FAILED',
+                error = $2,
+                updated_at = NOW()
+            WHERE id = $1
+              AND status = 'QUEUED'
+            `,
+            [job.id, existingBullJob.failedReason || "BullMQ job failed"],
+          );
+
+          continue;
+        } else {
+          continue;
+        }
+      }
+
+      const bullJob = await jobQueue.add(
+        "execute-job", //name/type of the individual BullMQ job.
+        {
+          jobId: job.id, //This is data that we're giving to the worker.
+        },
+        {
+          jobId: bullmqJobId, //Unique per recurring execution; stable across scheduler retries.
+          priority: -job.priority,
+          // -----------------------------------------------
+          // BullMQ retry configuration
+          //
+          // max_attempts is stored in PostgreSQL, so the
+          // queue gets the same retry limit.
+          // -----------------------------------------------
+
+          attempts: job.max_attempts,
+
+          // Wait 2 seconds before retrying.
+          backoff: {
+            type: "fixed",
+            delay: 2000,
+          },
+          removeOnComplete: true,
+        },
+      );
+
+      console.log("Added BullMQ job:", {
+        bullmqJobId: bullJob.id,
+        postgresJobId: job.id,
+      });
+    } catch (error) {
+      const notEnqueuedJobIds = jobs
+        .slice(index)
+        .map((pendingJob) => pendingJob.id);
+
+      await pool.query(
+        `
+        UPDATE jobs
+        SET status = 'PENDING', updated_at = NOW()
+        WHERE id = ANY($1::uuid[])
+          AND status = 'QUEUED'
+        `,
+        [notEnqueuedJobIds],
+      );
+
+      throw error;
+    }
+
     await pool.query(
       `
       INSERT INTO job_logs (job_id, event, message)
       VALUES ($1, $2, $3)
       `,
-      [job.id, "QUEUED", "Job queued by scheduler"],
+      [job.id, "QUEUED", "Job queued in BullMQ"],
     );
   }
 
@@ -30,11 +161,15 @@ export const startScheduler = () => {
   console.log("Scheduler started");
 
   setInterval(async () => {
+    console.log("Checking scheduled jobs...");
+
     try {
       const jobs = await queuePendingJobs();
 
       if (jobs.length > 0) {
-        console.log(`Queued ${jobs.length} job(s)`);
+        console.log(
+          `PostgreSQL marked ${jobs.length} job(s) QUEUED`,
+        );
       }
     } catch (error) {
       console.error("Scheduler error:", error);

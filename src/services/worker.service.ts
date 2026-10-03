@@ -1,5 +1,5 @@
 /*
-  FLOW Worker — Retry Support
+  FLOW Worker — BullMQ
 
   Job lifecycle:
 
@@ -8,6 +8,8 @@
       Scheduler
          ↓
       QUEUED
+         ↓
+      BullMQ / Redis
          ↓
       Worker picks the job
          ↓
@@ -19,274 +21,90 @@
       ↓                               ↓
   command succeeds               command fails
       ↓                               ↓
-  COMPLETED                    attempts < max_attempts?
+  COMPLETED                    BullMQ checks attempts
                                       │
                                ┌──────┴──────┐
                                ↓             ↓
-                              YES            NO
+                            attempts       attempts
+                            remaining      exhausted
                                ↓             ↓
-                            QUEUED         FAILED
+                           retry after     FAILED
+                           backoff
                                │
                                ↓
-                         Try the job again
+                          Worker runs
+                          the job again
 
-  `attempts` represents how many times the job
-  has actually been executed.
 
-  Example:
+  PostgreSQL:
+    - Permanent source of truth for job state and logs.
+    - Stores execution attempts and history.
 
-    max_attempts = 3
-
-    Attempt 1 → FAILED → QUEUED
-    Attempt 2 → FAILED → QUEUED
-    Attempt 3 → FAILED → FAILED permanently
-
-  PostgreSQL is currently being used as both:
-    1. Persistent storage for jobs
-    2. Temporary queue for this POC
-
-  Later, Redis/BullMQ can replace the database polling
-  mechanism for distributing jobs to workers.
+  Redis/BullMQ:
+    - Temporary/distributed queue.
+    - Delivers jobs to available workers.
+    - Handles retries and backoff.
 */
 
-import { exec } from "child_process";
-import { promisify } from "util";
+import { Worker } from "bullmq";
+import { Redis } from "ioredis";
+import dotenv from "dotenv";
+import {
+  workerId,
+  registerWorker,
+  startHeartbeat,
+} from "./worker_heartbeat.service.js";
+import { connection } from "../queues/job.queue.js";
 
-import { pool } from "../db.js";
+import { processJob } from "./job_processor.service.js";
 
-const execAsync = promisify(exec);
+dotenv.config();
 
-export const processJob = async () => {
-  try {
-    // --------------------------------------------------
-    // 1. Find one QUEUED job
-    //
-    // Higher priority jobs are processed first.
-    // If priorities are equal, older jobs are processed first.
-    // --------------------------------------------------
+// --------------------------------------------------
+// Start BullMQ Worker
+// --------------------------------------------------
 
-    const result = await pool.query(
-      `
-      SELECT *
-      FROM jobs
-      WHERE status = 'QUEUED'
-      ORDER BY priority DESC, created_at ASC
-      LIMIT 1
-      `,
-    );
+export const startWorker = async ()  => {
+  console.log(`FLOW BullMQ Worker started: ${workerId}`);
+  await registerWorker();
 
-    // No queued job available right now.
-    if (result.rows.length === 0) {
-      return;
-    }
+  startHeartbeat();
 
-    const job = result.rows[0];
-    // --------------------------------------------------
-    // 2. Mark the job as RUNNING
-    //
-    // Increment attempts because we are starting an
-    // actual execution attempt.
-    //
-    // RETURNING * gives us the updated job, including
-    // the new attempts value.
-    // --------------------------------------------------
+  const worker = new Worker(
+    "flow-jobs",
 
-    const runningResult = await pool.query(
-      `
-  UPDATE jobs
-  SET
-    status = 'RUNNING',
-    attempts = attempts + 1,
-    started_at = NOW(),
-    updated_at = NOW()
-  WHERE id = $1
-  RETURNING *
-  `,
-      [job.id],
-    );
+    async (job) => {
+      console.log("Received BullMQ job:", {
+        bullmqJobId: job.id,
+        postgresJobId: job.data.jobId,
+      });
 
-    const runningJob = runningResult.rows[0];
+      await processJob(job);
+    },
 
-    console.log(
-      `Running job: ${runningJob.name} (attempt ${runningJob.attempts}/${runningJob.max_attempts})`,
-    );
+    {
+      connection,
+      // Number of jobs this worker process can
+      // execute concurrently.
+      concurrency: 3,
+       // Detect workers that disappear while holding active jobs
+      stalledInterval: 5000,
+      maxStalledCount: 3, //BullMQ will allow the same job to be recovered from a stalled state up to 3 times.
+    },
+  );
 
-    // Record that this execution attempt started.
-    await pool.query(
-      `
-  INSERT INTO job_logs (job_id, event, message)
-  VALUES ($1, $2, $3)
-  `,
-      [runningJob.id, "STARTED", `Attempt ${runningJob.attempts} started`],
-    );
+  // --------------------------------------------------
+  // BullMQ worker events
+  // --------------------------------------------------
+  worker.on("completed", (job) => {
+    console.log(`[${workerId}] BullMQ job completed: ${job.id}`);
+  });
 
-    // --------------------------------------------------
-    // 3. Execute the actual command
-    //
-    // Example:
-    //
-    // job.command = "echo Hello FLOW"
-    //
-    // The operating system actually executes the command.
-    // --------------------------------------------------
+  worker.on("failed", (job, error) => {
+    console.error(`[${workerId}] BullMQ job failed: ${job?.id}`, error.message);
+  });
 
-    try {
-      const { stdout, stderr } = await execAsync(runningJob.command);
-
-      console.log("stdout:", stdout);
-
-      if (stderr) {
-        console.log("stderr:", stderr);
-      }
-
-      // ------------------------------------------------
-      // 4. Command succeeded
-      //
-      // RUNNING → COMPLETED
-      // ------------------------------------------------
-
-      await pool.query(
-        `
-  UPDATE jobs
-  SET
-    status = 'COMPLETED',
-    completed_at = NOW(),
-    error = NULL,
-    updated_at = NOW()
-  WHERE id = $1
-  `,
-        [job.id],
-      );
-
-      await pool.query(
-        `
-  INSERT INTO job_logs (job_id, event, message)
-  VALUES ($1, $2, $3)
-  `,
-        [
-          job.id,
-          "COMPLETED",
-          `Job completed successfully on attempt ${runningJob.attempts}`,
-        ],
-      );
-
-      console.log(`Job completed: ${job.name}`);
-    } catch (error) {
-      // ------------------------------------------------
-      // 5. Command failed
-      //
-      // The operating system reported an execution error.
-      // Now we decide whether the job should be retried.
-      // ------------------------------------------------
-
-      const message = error instanceof Error ? error.message : String(error);
-      const currentAttempt = runningJob.attempts;
-
-      await pool.query(
-        `
-  INSERT INTO job_logs (job_id, event, message)
-  VALUES ($1, $2, $3)
-  `,
-        [job.id, "FAILED", `Attempt ${currentAttempt} failed: ${message}`],
-      );
-
-      if (currentAttempt < job.max_attempts) {
-        // ----------------------------------------------
-        // Retry is still available.
-        //
-        // RUNNING → QUEUED
-        //
-        // The scheduler is not involved here.
-        // We directly put the job back into QUEUED so
-        // the worker can pick it up again.
-        // ----------------------------------------------
-
-        await pool.query(
-          `
-          UPDATE jobs
-          SET
-            status = 'QUEUED',
-            error = $1,
-            updated_at = NOW()
-          WHERE id = $2
-          `,
-          [message, job.id],
-        );
-        await pool.query(
-          `
-  INSERT INTO job_logs (job_id, event, message)
-  VALUES ($1, $2, $3)
-  `,
-          [
-            job.id,
-            "RETRYING",
-            `Retrying job (next attempt: ${currentAttempt + 1}/${job.max_attempts})`,
-          ],
-        );
-        console.log(
-          `Job failed: ${job.name}. Retrying (${currentAttempt}/${job.max_attempts})`,
-        );
-      } else {
-        // ----------------------------------------------
-        // No retries remaining.
-        //
-        // RUNNING → FAILED
-        // ----------------------------------------------
-
-        await pool.query(
-          `
-          UPDATE jobs
-          SET
-            status = 'FAILED',
-            error = $1,
-            updated_at = NOW()
-          WHERE id = $2
-          `,
-          [message, job.id],
-        );
-
-        console.error(
-          `Job permanently failed: ${job.name} (${currentAttempt}/${job.max_attempts})`,
-        );
-      }
-    }
-  } catch (error) {
-    // --------------------------------------------------
-    // This catches worker/database-level errors.
-    //
-    // Example:
-    // PostgreSQL connection failure
-    // SQL error
-    // etc.
-    // --------------------------------------------------
-
-    console.error("Worker error:", error);
-  }
-};
-
-export const startWorker = () => {
-  console.log("Worker started");
-
-  // Prevent this single worker from processing
-  // multiple jobs at the same time.
-  let isProcessing = false;
-
-  // Check for queued jobs every 2 seconds.
-  setInterval(async () => {
-    // If the worker is already processing a job,
-    // skip this interval cycle.
-    if (isProcessing) {
-      return;
-    }
-
-    isProcessing = true;
-
-    try {
-      await processJob();
-    } finally {
-      // Allow the worker to pick up another job
-      // after the current job finishes.
-      isProcessing = false;
-    }
-  }, 2000);
+  worker.on("error", (error) => {
+    console.error(`[${workerId}] BullMQ worker error:`, error);
+  });
 };

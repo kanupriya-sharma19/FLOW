@@ -7,7 +7,14 @@
     "postinstall": "prisma skills sync || exit 0",
     "dev": "tsx watch src/server.ts",
     "build": "tsc",
-    "start": "node dist/server.js"
+    "start": "node dist/server.js",
+    "db:init": "tsx src/init-db.ts",
+    "scheduler": "tsx watch src/scheduler.ts",
+    "start:scheduler": "node dist/scheduler.js",
+    "worker": "tsx watch src/worker.ts",
+    "start:worker": "node dist/worker.js",
+    "monitor": "tsx watch src/monitor.ts",
+    "start:monitor": "node dist/monitor.js"
   },
   "type": "module",
   "keywords": [],
@@ -15,9 +22,12 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "bullmq": "^6.3.11",
     "cors": "^2.8.6",
+    "cron-parser": "^5.10.1",
     "dotenv": "^18.0.5",
     "express": "^5.2.1",
+    "ioredis": "^6.0.0",
     "pg": "^8.23.1"
   },
   "devDependencies": {

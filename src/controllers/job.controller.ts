@@ -1,16 +1,110 @@
 import type { Request, Response } from "express";
 import { pool } from "../db.js";
 import { queuePendingJobs } from "../services/scheduler.service.js";
+import {
+  getBullMQExecutionId,
+  jobQueue,
+} from "../queues/job.queue.js";
+import { calculateNextRun } from "../services/cron.service.js";
 
 // CREATE
 export const createJob = async (req: Request, res: Response) => {
   try {
-    const { name, command, priority = 0, maxAttempts = 3 } = req.body;
+    const {
+      name,
+      command,
+      priority = 0,
+      maxAttempts = 3,
+      scheduleType = "ONCE",
+      scheduledAt = null,
+      cronExpression = null,
+      nextRunAt = null,
+    } = req.body;
 
     if (!name || !command) {
       return res.status(400).json({
         error: "name and command are required",
       });
+    }
+
+    // -----------------------------------------------
+    // Validate schedule
+    // -----------------------------------------------
+
+    if (
+      scheduleType !== "IMMEDIATE" &&
+      scheduleType !== "ONCE" &&
+      scheduleType !== "RECURRING"
+    ) {
+      return res.status(400).json({
+        error: "Invalid schedule type",
+      });
+    }
+
+    if (scheduleType === "ONCE" && !scheduledAt) {
+      return res.status(400).json({
+        error: "scheduledAt is required for ONCE jobs",
+      });
+    }
+
+    let scheduledAtForDatabase = scheduledAt;
+
+    if (scheduleType === "ONCE") {
+      if (typeof scheduledAt !== "string") {
+        return res.status(400).json({
+          error: "scheduledAt must be an ISO 8601 timestamp",
+        });
+      }
+
+      const hasTimezone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(scheduledAt);
+      const localDateTimePattern =
+        /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/;
+
+      if (!hasTimezone && !localDateTimePattern.test(scheduledAt)) {
+        return res.status(400).json({
+          error: "scheduledAt must be an ISO 8601 timestamp",
+        });
+      }
+
+      // Legacy clients send local India times without an explicit offset.
+      scheduledAtForDatabase = hasTimezone
+        ? scheduledAt
+        : `${scheduledAt.replace(" ", "T")}+05:30`;
+
+      if (!Number.isFinite(Date.parse(scheduledAtForDatabase))) {
+        return res.status(400).json({
+          error: "scheduledAt must be a valid timestamp",
+        });
+      }
+    }
+
+    if (scheduleType === "RECURRING" && !cronExpression) {
+      return res.status(400).json({
+        error: "cronExpression is required for RECURRING jobs",
+      });
+    }
+
+    let initialNextRunAt = null;
+
+    if (scheduleType === "RECURRING") {
+      try {
+        const calculatedNextRunAt = calculateNextRun(
+          cronExpression,
+          new Date(),
+        );
+        initialNextRunAt = nextRunAt ?? calculatedNextRunAt;
+
+        if (!Number.isFinite(new Date(initialNextRunAt).getTime())) {
+          throw new Error("nextRunAt must be a valid date");
+        }
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : String(error);
+
+        return res.status(400).json({
+          error: `Invalid recurring schedule: ${message}`,
+        });
+      }
     }
 
     const result = await pool.query(
@@ -19,22 +113,38 @@ export const createJob = async (req: Request, res: Response) => {
         name,
         command,
         priority,
-        max_attempts
+        max_attempts,
+        schedule_type,
+        scheduled_at,
+        cron_expression,
+        next_run_at
       )
-      VALUES ($1, $2, $3, $4)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
       RETURNING *
       `,
-      [name, command, priority, maxAttempts],
+      [
+        name,
+        command,
+        priority,
+        maxAttempts,
+        scheduleType,
+        scheduledAtForDatabase,
+        cronExpression,
+        initialNextRunAt,
+      ],
     );
+
     const job = result.rows[0];
+
     await pool.query(
       `
-  INSERT INTO job_logs (job_id, event, message)
-  VALUES ($1, $2, $3)
-  `,
+      INSERT INTO job_logs (job_id, event, message)
+      VALUES ($1, $2, $3)
+      `,
       [job.id, "CREATED", "Job created"],
     );
-    return res.status(201).json(result.rows[0]);
+
+    return res.status(201).json(job);
   } catch (error) {
     console.error("Failed to create job:", error);
 
@@ -167,9 +277,16 @@ export const deleteJob = async (req: Request, res: Response) => {
 };
 
 // CANCEL
-export const cancelJob = async (req: Request, res: Response) => {
+export const cancelJob = async (
+  req: Request<{ id: string }>,
+  res: Response,
+) => {
   try {
     const { id } = req.params;
+
+    // --------------------------------------------------
+    // 1. Mark PostgreSQL job as CANCELLED
+    // --------------------------------------------------
 
     const result = await pool.query(
       `
@@ -205,6 +322,26 @@ export const cancelJob = async (req: Request, res: Response) => {
       });
     }
 
+    // --------------------------------------------------
+    // 2. Remove job from BullMQ
+    // --------------------------------------------------
+
+    const cancelledJob = result.rows[0];
+    const bullmqJobId = getBullMQExecutionId(cancelledJob);
+    const bullJob =
+      (await jobQueue.getJob(bullmqJobId)) ??
+      (bullmqJobId === id ? null : await jobQueue.getJob(id));
+
+    if (bullJob) {
+      await bullJob.remove();
+
+      console.log(`Removed job ${id} from BullMQ`);
+    }
+
+    // --------------------------------------------------
+    // 3. Return cancelled job
+    // --------------------------------------------------
+
     return res.json(result.rows[0]);
   } catch (error) {
     console.error("Failed to cancel job:", error);
@@ -214,7 +351,6 @@ export const cancelJob = async (req: Request, res: Response) => {
     });
   }
 };
-
 // QUEUE PENDING JOBS
 
 export const queueJobs = async (_req: Request, res: Response) => {

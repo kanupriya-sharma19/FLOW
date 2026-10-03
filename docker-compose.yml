@@ -1,4 +1,9 @@
+name: flow
 services:
+
+  # =========================================
+  # PostgreSQL
+  # =========================================
   postgres:
     image: postgres:17
     container_name: flow-postgres
@@ -17,5 +22,97 @@ services:
     volumes:
       - flow_postgres_data:/var/lib/postgresql/data
 
+
+  # =========================================
+  # Redis
+  # =========================================
+  redis:
+    image: redis:7
+    container_name: flow-redis
+
+    ports:
+      - "6379:6379"
+
+    volumes:
+      - flow_redis_data:/data
+
+
+  # =========================================
+  # FLOW API
+  # =========================================
+  api:
+    build: .
+    container_name: flow-api
+
+    command: ["node", "dist/server.js"]
+
+    environment:
+      DATABASE_URL: postgresql://flow:flow@postgres:5432/flow
+      REDIS_URL: redis://redis:6379
+      PORT: 8000
+
+    ports:
+      - "8000:8000"
+
+    depends_on:
+      - postgres
+      - redis
+
+
+  # =========================================
+  # FLOW SCHEDULER
+  # =========================================
+  scheduler:
+    build: .
+
+    command: ["node", "dist/scheduler.js"]
+
+    environment:
+      DATABASE_URL: postgresql://flow:flow@postgres:5432/flow
+      REDIS_URL: redis://redis:6379
+
+    depends_on:
+      - postgres
+      - redis
+
+
+  # =========================================
+  # FLOW WORKER
+  # =========================================
+  worker:
+    build: .
+
+    command: ["node", "dist/worker.js"]
+
+    environment:
+      DATABASE_URL: postgresql://flow:flow@postgres:5432/flow
+      REDIS_URL: redis://redis:6379
+
+    depends_on:
+      - postgres
+      - redis
+
+
+  # =========================================
+  # FLOW WORKER MONITOR
+  # =========================================
+  monitor:
+    build: .
+
+    command: ["node", "dist/monitor.js"]
+
+    environment:
+      DATABASE_URL: postgresql://flow:flow@postgres:5432/flow
+      REDIS_URL: redis://redis:6379
+
+    depends_on:
+      - postgres
+      - redis
+
+
+# =========================================
+# Persistent volumes
+# =========================================
 volumes:
   flow_postgres_data:
+  flow_redis_data:

@@ -21,14 +21,48 @@ const createTables = async () => {
       attempts INT NOT NULL DEFAULT 0,
       max_attempts INT NOT NULL DEFAULT 3,
 
+      schedule_type VARCHAR(20) NOT NULL DEFAULT 'IMMEDIATE',
+      scheduled_at TIMESTAMPTZ,
+      cron_expression TEXT,
+      next_run_at TIMESTAMPTZ,
+
       created_at TIMESTAMP NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
 
       started_at TIMESTAMP,
       completed_at TIMESTAMP,
 
+      worker_id VARCHAR(255),
+
       error TEXT
     );
+  `);
+
+  await pool.query(`
+    ALTER TABLE jobs
+      ADD COLUMN IF NOT EXISTS schedule_type VARCHAR(20) NOT NULL DEFAULT 'IMMEDIATE',
+      ADD COLUMN IF NOT EXISTS scheduled_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS cron_expression TEXT,
+      ADD COLUMN IF NOT EXISTS next_run_at TIMESTAMPTZ;
+  `);
+
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'jobs'
+          AND column_name = 'scheduled_at'
+          AND data_type = 'timestamp without time zone'
+      ) THEN
+        ALTER TABLE jobs
+          ALTER COLUMN scheduled_at TYPE TIMESTAMPTZ
+          USING scheduled_at AT TIME ZONE 'Asia/Kolkata';
+      END IF;
+    END
+    $$;
   `);
 
   // ---------------------------------------------
@@ -54,6 +88,17 @@ const createTables = async () => {
     );
   `);
 
+  await pool.query(`
+   CREATE TABLE IF NOT EXISTS workers (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    worker_id VARCHAR(255) UNIQUE NOT NULL,
+    status VARCHAR(50) NOT NULL DEFAULT 'ONLINE',
+    last_heartbeat TIMESTAMP NOT NULL DEFAULT NOW(),
+    current_job_id UUID,
+    started_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+    );
+  `);
   console.log("Database initialized");
 
   await pool.end();
