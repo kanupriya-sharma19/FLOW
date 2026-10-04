@@ -33,7 +33,6 @@ const createTables = async () => {
       completed_at TIMESTAMP,
 
       worker_id VARCHAR(255),
-
       error TEXT
     );
   `);
@@ -99,6 +98,57 @@ const createTables = async () => {
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
     );
   `);
+
+    // ---------------------------------------------
+  // Job executions table
+  //
+  // Stores every individual execution attempt.
+  //
+  // One job can have many executions because of
+  // retries and recurring runs.
+  // ---------------------------------------------
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS job_executions (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+      job_id UUID NOT NULL
+        REFERENCES jobs(id)
+        ON DELETE CASCADE,
+
+      worker_id VARCHAR(255),
+
+      attempt INT NOT NULL,
+
+      status VARCHAR(30) NOT NULL DEFAULT 'RUNNING',
+
+      started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+      completed_at TIMESTAMPTZ,
+
+      error TEXT,
+
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  // ---------------------------------------------
+  // Indexes
+  //
+  // Used frequently when querying execution
+  // history for a job or worker.
+  // ---------------------------------------------
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_job_executions_job_id
+    ON job_executions(job_id);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_job_executions_worker_id
+    ON job_executions(worker_id);
+  `);
+
   console.log("Database initialized");
 
   await pool.end();

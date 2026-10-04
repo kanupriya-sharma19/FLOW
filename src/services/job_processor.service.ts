@@ -1,5 +1,4 @@
-import { exec } from "child_process";
-import { promisify } from "util";
+import { spawn } from "child_process";
 import dotenv from "dotenv";
 
 import { pool } from "../db.js";
@@ -8,7 +7,6 @@ import { calculateNextRun } from "./cron.service.js";
 
 dotenv.config();
 
-const execAsync = promisify(exec);
 
 // ==================================================
 // TYPES
@@ -70,7 +68,7 @@ const markJobAsRunning = async (job: Job) => {
     WHERE id = $1
     RETURNING *
     `,
-    [job.id, workerId],
+    [job.id,workerId],
   );
 
   return result.rows[0];
@@ -91,22 +89,88 @@ const addJobLog = async (jobId: string, event: string, message: string) => {
 };
 
 // ==================================================
-// 5. EXECUTE COMMAND
+// 5. LOG JOB EXECUTION TO DATABASE
 // ==================================================
 
-const executeCommand = async (job: Job) => {
-  const { stdout, stderr } = await execAsync(job.command);
+const createJobExecution = async (job: Job) => {
+  const result = await pool.query(
+    `
+    INSERT INTO job_executions (
+      job_id,
+      worker_id,
+      attempt,
+      status,
+      started_at
+    )
+    VALUES ($1, $2, $3, 'RUNNING', NOW())
+    RETURNING *
+    `,
+    [job.id, workerId, job.attempts],
+  );
 
-  console.log("stdout:", stdout);
+  return result.rows[0];
+};
 
-  if (stderr) {
-    console.log("stderr:", stderr);
-  }
+const completeJobExecution = async (executionId: string) => {
+  await pool.query(
+    `
+    UPDATE job_executions
+    SET
+      status = 'COMPLETED',
+      completed_at = NOW()
+    WHERE id = $1
+    `,
+    [executionId],
+  );
+};
+
+const failJobExecution = async (executionId: string, error: string) => {
+  await pool.query(
+    `
+    UPDATE job_executions
+    SET
+      status = 'FAILED',
+      completed_at = NOW(),
+      error = $1
+    WHERE id = $2
+    `,
+    [error, executionId],
+  );
 };
 
 // ==================================================
-// 6. CALCULATE NEXT RUN
+// 6. EXECUTE COMMAND
 // ==================================================
+const executeCommand = (job: Job): Promise<void> => {
+  return new Promise((resolve, reject) => {
+    const child = spawn(job.command, {
+      shell: true,
+      env: {
+        ...process.env,
+        FLOW_ATTEMPT: String(job.attempts),
+      },
+    });
+
+    child.stdout.on("data", (data) => {
+      console.log("stdout:", data.toString());
+    });
+
+    child.stderr.on("data", (data) => {
+      console.log("stderr:", data.toString());
+    });
+
+    child.on("error", reject);
+
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(`Command exited with code ${code}`));
+      }
+    });
+  });
+};
+
 // ==================================================
 // 7. HANDLE SUCCESS
 // ==================================================
@@ -181,7 +245,6 @@ const handleJobSuccess = async (job: Job) => {
 // ==================================================
 // 8. HANDLE FAILURE
 // ==================================================
-
 const handleJobFailure = async (job: Job, error: unknown) => {
   const message = error instanceof Error ? error.message : String(error);
 
@@ -198,48 +261,16 @@ const handleJobFailure = async (job: Job, error: unknown) => {
   );
 
   // -----------------------------------------------
-  // Retry available
-  // -----------------------------------------------
-
-  if (currentAttempt < job.max_attempts) {
-    await pool.query(
-      `
-      UPDATE jobs
-      SET
-        status = 'QUEUED',
-        error = $1,
-        worker_id = NULL,
-        updated_at = NOW()
-      WHERE id = $2
-      `,
-      [message, job.id],
-    );
-
-    await addJobLog(
-      job.id,
-      "RETRYING",
-      `BullMQ will retry job. Next attempt: ${
-        currentAttempt + 1
-      }/${job.max_attempts}`,
-    );
-
-    console.log(
-      `Job failed: ${job.name}. ` +
-        `BullMQ will retry (${currentAttempt + 1}/${job.max_attempts})`,
-    );
-
-    return;
-  }
-
-  // -----------------------------------------------
-  // No retries remaining
+  // Update PostgreSQL
+  //
+  // BullMQ decides whether another attempt happens.
   // -----------------------------------------------
 
   await pool.query(
     `
     UPDATE jobs
     SET
-      status = 'FAILED',
+      status = 'QUEUED',
       error = $1,
       worker_id = NULL,
       updated_at = NOW()
@@ -248,9 +279,9 @@ const handleJobFailure = async (job: Job, error: unknown) => {
     [message, job.id],
   );
 
-  console.error(
-    `Job permanently failed: ${job.name} ` +
-      `(${currentAttempt}/${job.max_attempts})`,
+  console.log(
+    `Job failed: ${job.name}. ` +
+      `BullMQ will handle retry if attempts remain.`,
   );
 };
 
@@ -283,6 +314,7 @@ export const processJob = async (job: any) => {
     // -----------------------------------------------
 
     const runningJob = await markJobAsRunning(dbJob);
+    const execution = await createJobExecution(runningJob);
 
     console.log(
       `Running job: ${runningJob.name} ` +
@@ -305,12 +337,16 @@ export const processJob = async (job: any) => {
       // ---------------------------------------------
       // Success
       // ---------------------------------------------
+      await completeJobExecution(execution.id);
 
       await handleJobSuccess(runningJob);
     } catch (error) {
       // ---------------------------------------------
       // Failure
       // ---------------------------------------------
+      const message = error instanceof Error ? error.message : String(error);
+
+      await failJobExecution(execution.id, message);
 
       await handleJobFailure(runningJob, error);
 

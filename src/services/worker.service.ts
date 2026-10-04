@@ -45,7 +45,7 @@
     - Delivers jobs to available workers.
     - Handles retries and backoff.
 */
-
+import { pool } from "../db.js";
 import { Worker } from "bullmq";
 import { Redis } from "ioredis";
 import dotenv from "dotenv";
@@ -64,7 +64,7 @@ dotenv.config();
 // Start BullMQ Worker
 // --------------------------------------------------
 
-export const startWorker = async ()  => {
+export const startWorker = async () => {
   console.log(`FLOW BullMQ Worker started: ${workerId}`);
   await registerWorker();
 
@@ -74,7 +74,6 @@ export const startWorker = async ()  => {
     "flow-jobs",
 
     async (job) => {
-
       await processJob(job);
     },
 
@@ -83,7 +82,7 @@ export const startWorker = async ()  => {
       // Number of jobs this worker process can
       // execute concurrently.
       concurrency: 3,
-       // Detect workers that disappear while holding active jobs
+      // Detect workers that disappear while holding active jobs
       stalledInterval: 5000,
       maxStalledCount: 3, //BullMQ will allow the same job to be recovered from a stalled state up to 3 times.
     },
@@ -96,8 +95,55 @@ export const startWorker = async ()  => {
     console.log(`[${workerId}] BullMQ job completed: ${job.id}`);
   });
 
-  worker.on("failed", (job, error) => {
-    console.error(`[${workerId}] BullMQ job failed: ${job?.id}`, error.message);
+  worker.on("failed", async (job, error) => {
+    if (!job) {
+      return;
+    }
+
+    console.error(`[${workerId}] BullMQ job failed: ${job.id}`, error.message);
+
+    // BullMQ attemptsMade is the number of attempts
+    // that have already been made.
+    const maxAttempts = job.opts.attempts ?? 1;
+
+    if (job.attemptsMade >= maxAttempts) {
+      console.error(`[${workerId}] BullMQ permanently failed job: ${job.id}`);
+
+      try {
+        await pool.query(
+          `
+        UPDATE jobs
+        SET
+          status = 'FAILED',
+          error = $1,
+          worker_id = NULL,
+          updated_at = NOW()
+        WHERE id = $2
+        `,
+          [error.message, job.data.jobId],
+        );
+
+        await pool.query(
+          `
+        INSERT INTO job_logs (
+          job_id,
+          event,
+          message
+        )
+        VALUES ($1, 'FAILED', $2)
+        `,
+          [
+            job.data.jobId,
+            `Job permanently failed after ${job.attemptsMade} attempts: ${error.message}`,
+          ],
+        );
+      } catch (dbError) {
+        console.error(
+          `[${workerId}] Failed to update PostgreSQL after final failure:`,
+          dbError,
+        );
+      }
+    }
   });
 
   worker.on("error", (error) => {
