@@ -27,6 +27,7 @@ The current codebase already includes:
 - Immediate, one-time, and recurring job scheduling
 - Priority-aware queue ordering
 - PostgreSQL-backed job state and job history
+- Per-attempt execution records, including worker, attempt number, outcome, timestamps, and error
 - BullMQ queue delivery via Redis
 - Three independent Docker worker containers consuming the same BullMQ queue concurrently
 - Worker heartbeats and active monitoring
@@ -40,7 +41,7 @@ The current codebase already includes:
 ```mermaid
 flowchart LR
     Client[Client / API Consumer] --> API[Express API\nPOST /jobs\nGET /jobs\nPATCH /jobs/:id]
-    API --> PG[(PostgreSQL\njobs, job_logs, workers)]
+    API --> PG[(PostgreSQL\njobs, job_logs, workers, job_executions)]
     Scheduler --> PG
     Scheduler --> Queue[Redis + BullMQ\nflow-jobs]
     Queue --> Worker1[flow-worker-1]
@@ -58,7 +59,7 @@ flowchart LR
 
 The architecture intentionally separates responsibilities:
 
-- PostgreSQL: durable state
+- PostgreSQL: durable job state, lifecycle logs, worker records, and per-attempt execution history
 - BullMQ/Redis: work dispatch and retry coordination
 - Workers: actual command execution
 - Monitor: liveness/recovery checks
@@ -69,7 +70,7 @@ The architecture intentionally separates responsibilities:
 | Component | Role | Why it exists |
 |---|---|---|
 | API server | Express app and REST endpoints | Accepts job creation and management requests without doing execution work directly |
-| PostgreSQL | Source of truth for jobs and logs | Keeps state durable, queryable, and auditable |
+| PostgreSQL | Source of truth for jobs, logs, workers, and execution attempts | Keeps state durable, queryable, and auditable |
 | Scheduler | Polls pending jobs and enqueues them | Moves jobs from database state to BullMQ queue |
 | BullMQ + Redis | Queue, retry, and concurrency coordination | Decouples producers from consumers and provides job distribution |
 | Three worker containers | Each runs the same worker service and executes `job.command` from the shared queue | Separates execution from HTTP handling and allows the three consumers to process jobs concurrently |
@@ -82,10 +83,12 @@ The project initializes PostgreSQL tables in `src/init-db.ts`. The important tab
 - `jobs`: current job state
 - `job_logs`: event history for each job
 - `workers`: worker identity, status, and heartbeat timestamps
+- `job_executions`: one record for each worker execution attempt, including retries and recurring runs
 
 ```mermaid
 erDiagram
     JOBS ||--o{ JOB_LOGS : logs
+    JOBS ||--o{ JOB_EXECUTIONS : attempts
     WORKERS ||--o{ JOBS : owns
 
     JOBS {
@@ -125,6 +128,18 @@ erDiagram
         TIMESTAMP started_at
         TIMESTAMP updated_at
     }
+
+    JOB_EXECUTIONS {
+        UUID id PK
+        UUID job_id FK
+        VARCHAR worker_id
+        INT attempt
+        VARCHAR status
+        TIMESTAMPTZ started_at
+        TIMESTAMPTZ completed_at
+        TEXT error
+        TIMESTAMPTZ created_at
+    }
 ```
 
 ### Key job fields
@@ -141,7 +156,9 @@ The `jobs` table stores:
 - `worker_id`: last worker that claimed the job
 - `error`: last failure message
 
-`job_logs` records the lifecycle events of each job, such as `CREATED`, `QUEUED`, `STARTED`, `COMPLETED`, `FAILED`, `RETRYING`, and `CANCELLED`.
+`job_logs` records the lifecycle events of each job, such as `CREATED`, `QUEUED`, `STARTED`, `COMPLETED`, `FAILED`, and `CANCELLED`.
+
+`job_executions` keeps per-attempt history separately from the current `jobs` row. The worker inserts a `RUNNING` record when it starts an attempt and updates that record to `COMPLETED` or `FAILED` with its completion timestamp; failed records also contain the error message. The table is created, with indexes on `job_id` and `worker_id`, by `npm run db:init`. There is no API endpoint for querying execution records.
 
 ## API and request flow
 
@@ -426,9 +443,10 @@ When a job is picked up, the worker:
 2. Checks whether the job has been cancelled
 3. Marks the job `RUNNING`
 4. Increments `attempts`
-5. Executes `child_process.exec(job.command)`
-6. Updates success/failure state in PostgreSQL
-7. Re-throws on failure so BullMQ handles the retry backoff
+5. Creates a `job_executions` record for the attempt
+6. Runs `job.command` through `child_process.spawn` with `shell: true`, streaming stdout/stderr to the worker logs and exposing the attempt number as `FLOW_ATTEMPT`
+7. Updates the execution record and job state in PostgreSQL on success or failure
+8. Re-throws on failure so BullMQ handles the retry backoff
 
 ## Worker heartbeat and monitoring
 
@@ -471,12 +489,13 @@ The worker logs each stage of execution. The logs are written to the `job_logs` 
 - `CREATED`
 - `QUEUED`
 - `STARTED`
-- `RETRYING`
 - `COMPLETED`
 - `FAILED`
 - `CANCELLED`
 
-The database row itself is the durable state machine. For example:
+`job_logs` is the lifecycle event stream, while `job_executions` records the outcome and timing of each individual worker attempt. A retried job therefore has multiple execution rows even though it still has one `jobs` row. Recurring runs also create separate execution records against their shared job definition.
+
+The `jobs` row remains the durable current state machine. For example:
 
 - `PENDING` means the job has been created but not yet eligible to queue
 - `QUEUED` means the scheduler has moved it into the BullMQ-ready state
