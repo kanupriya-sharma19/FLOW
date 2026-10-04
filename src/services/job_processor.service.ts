@@ -7,12 +7,26 @@ import { calculateNextRun } from "./cron.service.js";
 
 dotenv.config();
 
-
 // ==================================================
 // TYPES
 // ==================================================
 
 type Job = any;
+
+type ExecutionResult = {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+};
+
+type ExecutionError = {
+  message: string;
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+};
+
+const EXECUTION_TIMEOUT_MS = 30_000;
 
 // ==================================================
 // 1. FETCH JOB
@@ -68,7 +82,7 @@ const markJobAsRunning = async (job: Job) => {
     WHERE id = $1
     RETURNING *
     `,
-    [job.id,workerId],
+    [job.id, workerId],
   );
 
   return result.rows[0];
@@ -111,38 +125,61 @@ const createJobExecution = async (job: Job) => {
   return result.rows[0];
 };
 
-const completeJobExecution = async (executionId: string) => {
+const completeJobExecution = async (
+  executionId: string,
+  stdout = "",
+  stderr = "",
+  exitCode = 0,
+) => {
   await pool.query(
     `
     UPDATE job_executions
     SET
       status = 'COMPLETED',
-      completed_at = NOW()
-    WHERE id = $1
+      completed_at = NOW(),
+      stdout = $1,
+      stderr = $2,
+      exit_code = $3
+    WHERE id = $4
     `,
-    [executionId],
+    [stdout, stderr, exitCode, executionId],
   );
 };
 
-const failJobExecution = async (executionId: string, error: string) => {
+const failJobExecution = async (
+  executionId: string,
+  error: string,
+  stdout = "",
+  stderr = "",
+  exitCode: number | null = null,
+) => {
   await pool.query(
     `
     UPDATE job_executions
     SET
       status = 'FAILED',
       completed_at = NOW(),
-      error = $1
-    WHERE id = $2
+      error = $1,
+      stdout = $2,
+      stderr = $3,
+      exit_code = $4
+    WHERE id = $5
     `,
-    [error, executionId],
+    [error, stdout, stderr, exitCode, executionId],
   );
 };
 
 // ==================================================
 // 6. EXECUTE COMMAND
+//
+// Existing command-job behavior.
 // ==================================================
-const executeCommand = (job: Job): Promise<void> => {
+
+const executeCommand = (job: Job): Promise<ExecutionResult> => {
   return new Promise((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+
     const child = spawn(job.command, {
       shell: true,
       env: {
@@ -152,27 +189,156 @@ const executeCommand = (job: Job): Promise<void> => {
     });
 
     child.stdout.on("data", (data) => {
-      console.log("stdout:", data.toString());
+      const output = data.toString();
+      stdout += output;
+      console.log("stdout:", output);
     });
 
     child.stderr.on("data", (data) => {
-      console.log("stderr:", data.toString());
+      const output = data.toString();
+      stderr += output;
+      console.log("stderr:", output);
     });
 
-    child.on("error", reject);
+    child.on("error", (error) => {
+      reject({
+        message: error.message,
+        stdout,
+        stderr,
+        exitCode: null,
+      });
+    });
 
     child.on("close", (code) => {
       if (code === 0) {
-        resolve();
+        resolve({
+          stdout,
+          stderr,
+          exitCode: 0,
+        });
       } else {
-        reject(new Error(`Command exited with code ${code}`));
+        reject({
+          message: `Command exited with code ${code}`,
+          stdout,
+          stderr,
+          exitCode: code ?? 1,
+        });
       }
     });
   });
 };
 
 // ==================================================
-// 7. HANDLE SUCCESS
+// 7. EXECUTE PYTHON FILE
+//
+// Temporary implementation.
+//
+// This executes Python directly on the worker machine.
+// We will replace this with an isolated container next.
+// ==================================================
+const executePythonFile = (job: Job): Promise<ExecutionResult> => {
+  return new Promise((resolve, reject) => {
+    if (!job.file_path) {
+      reject(new Error("File job has no file_path"));
+      return;
+    }
+
+    if (job.runtime !== "PYTHON") {
+      reject(new Error(`Unsupported file runtime: ${job.runtime}`));
+      return;
+    }
+
+    let stdout = "";
+    let stderr = "";
+
+    const child = spawn("python3", [job.file_path], {
+      shell: false,
+      env: {
+        ...process.env,
+        FLOW_ATTEMPT: String(job.attempts),
+      },
+    });
+
+    let timedOut = false;
+
+    const timeout = setTimeout(() => {
+      timedOut = true;
+
+      console.log(
+        `Python job ${job.name} exceeded execution timeout of ${EXECUTION_TIMEOUT_MS}ms`,
+      );
+
+      child.kill();
+    }, EXECUTION_TIMEOUT_MS);
+
+    child.stdout.on("data", (data) => {
+      const output = data.toString();
+      stdout += output;
+      console.log("stdout:", output);
+    });
+
+    child.stderr.on("data", (data) => {
+      const output = data.toString();
+      stderr += output;
+      console.log("stderr:", output);
+    });
+
+    child.on("error", reject);
+
+    child.on("close", (code) => {
+      clearTimeout(timeout);
+
+      if (timedOut) {
+        reject({
+          message: `Python process exceeded execution timeout of ${
+            EXECUTION_TIMEOUT_MS / 1000
+          } seconds`,
+          stdout,
+          stderr,
+          exitCode: null,
+        });
+
+        return;
+      }
+
+      if (code === 0) {
+        resolve({
+          stdout,
+          stderr,
+          exitCode: 0,
+        });
+      } else {
+        reject({
+          message: `Python process exited with code ${code}`,
+          stdout,
+          stderr,
+          exitCode: code ?? 1,
+        });
+      }
+    });
+  });
+};
+
+// ==================================================
+// 8. EXECUTE JOB
+//
+// Chooses the execution strategy based on job type.
+// ==================================================
+
+const executeJob = (job: Job): Promise<ExecutionResult> => {
+  if (job.job_type === "COMMAND") {
+    return executeCommand(job);
+  }
+
+  if (job.job_type === "FILE") {
+    return executePythonFile(job);
+  }
+
+  return Promise.reject(new Error(`Unsupported job type: ${job.job_type}`));
+};
+
+// ==================================================
+// 9. HANDLE SUCCESS
 // ==================================================
 
 const handleJobSuccess = async (job: Job) => {
@@ -243,28 +409,24 @@ const handleJobSuccess = async (job: Job) => {
 };
 
 // ==================================================
-// 8. HANDLE FAILURE
+// 10. HANDLE FAILURE
 // ==================================================
+
 const handleJobFailure = async (job: Job, error: unknown) => {
-  const message = error instanceof Error ? error.message : String(error);
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof error === "object" && error !== null && "message" in error
+        ? String(error.message)
+        : String(error);
 
   const currentAttempt = job.attempts;
-
-  // -----------------------------------------------
-  // Log failure
-  // -----------------------------------------------
 
   await addJobLog(
     job.id,
     "FAILED",
     `Attempt ${currentAttempt} failed: ${message}`,
   );
-
-  // -----------------------------------------------
-  // Update PostgreSQL
-  //
-  // BullMQ decides whether another attempt happens.
-  // -----------------------------------------------
 
   await pool.query(
     `
@@ -286,7 +448,7 @@ const handleJobFailure = async (job: Job, error: unknown) => {
 };
 
 // ==================================================
-// 9. MAIN WORKER FUNCTION
+// 11. MAIN WORKER FUNCTION
 // ==================================================
 
 export const processJob = async (job: any) => {
@@ -314,6 +476,13 @@ export const processJob = async (job: any) => {
     // -----------------------------------------------
 
     const runningJob = await markJobAsRunning(dbJob);
+
+    await addJobLog(
+      runningJob.id,
+      "WORKER_ASSIGNED",
+      `Attempt ${runningJob.attempts} assigned to worker ${workerId}`,
+    );
+
     const execution = await createJobExecution(runningJob);
 
     console.log(
@@ -328,25 +497,37 @@ export const processJob = async (job: any) => {
     );
 
     // -----------------------------------------------
-    // Execute command
+    // Execute
     // -----------------------------------------------
 
     try {
-      await executeCommand(runningJob);
+      const result = await executeJob(runningJob);
 
       // ---------------------------------------------
       // Success
       // ---------------------------------------------
-      await completeJobExecution(execution.id);
+      await completeJobExecution(
+        execution.id,
+        result.stdout,
+        result.stderr,
+        result.exitCode,
+      );
 
       await handleJobSuccess(runningJob);
     } catch (error) {
       // ---------------------------------------------
       // Failure
       // ---------------------------------------------
-      const message = error instanceof Error ? error.message : String(error);
 
-      await failJobExecution(execution.id, message);
+      const executionError = error as ExecutionError;
+
+      await failJobExecution(
+        execution.id,
+        executionError.message,
+        executionError.stdout,
+        executionError.stderr,
+        executionError.exitCode,
+      );
 
       await handleJobFailure(runningJob, error);
 

@@ -1,4 +1,5 @@
 import { Router } from "express";
+import multer from "multer";
 
 import {
   createJob,
@@ -7,12 +8,16 @@ import {
   updateJob,
   deleteJob,
   cancelJob,
-  queueJobs
+  queueJobs,
 } from "../controllers/job.controller.js";
 
 const router = Router();
 
-router.post("/", createJob);
+const upload = multer({
+  dest: "uploads/",
+});
+
+router.post("/", upload.single("file"), createJob);
 
 router.get("/", getJobs);
 

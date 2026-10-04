@@ -13,23 +13,50 @@ export const createJob = async (req: Request, res: Response) => {
     const {
       name,
       command,
+      runtime,
       priority = 0,
       maxAttempts = 3,
-      scheduleType = "ONCE",
+      scheduleType = "IMMEDIATE",
       scheduledAt = null,
       cronExpression = null,
       nextRunAt = null,
     } = req.body;
 
-    if (!name || !command) {
+    const uploadedFile = req.file;
+
+    // --------------------------------------------------
+    // Determine job type
+    // --------------------------------------------------
+
+    const jobType = uploadedFile ? "FILE" : "COMMAND";
+
+    // --------------------------------------------------
+    // Validate basic fields
+    // --------------------------------------------------
+
+    if (!name) {
       return res.status(400).json({
-        error: "name and command are required",
+        error: "name is required",
       });
     }
 
-    // -----------------------------------------------
+    // COMMAND job
+    if (jobType === "COMMAND" && !command) {
+      return res.status(400).json({
+        error: "command is required for COMMAND jobs",
+      });
+    }
+
+    // FILE job
+    if (jobType === "FILE" && !runtime) {
+      return res.status(400).json({
+        error: "runtime is required for FILE jobs",
+      });
+    }
+
+    // --------------------------------------------------
     // Validate schedule
-    // -----------------------------------------------
+    // --------------------------------------------------
 
     if (
       scheduleType !== "IMMEDIATE" &&
@@ -57,6 +84,7 @@ export const createJob = async (req: Request, res: Response) => {
       }
 
       const hasTimezone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(scheduledAt);
+
       const localDateTimePattern =
         /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/;
 
@@ -66,7 +94,6 @@ export const createJob = async (req: Request, res: Response) => {
         });
       }
 
-      // Legacy clients send local India times without an explicit offset.
       scheduledAtForDatabase = hasTimezone
         ? scheduledAt
         : `${scheduledAt.replace(" ", "T")}+05:30`;
@@ -77,6 +104,10 @@ export const createJob = async (req: Request, res: Response) => {
         });
       }
     }
+
+    // --------------------------------------------------
+    // Validate recurring schedule
+    // --------------------------------------------------
 
     if (scheduleType === "RECURRING" && !cronExpression) {
       return res.status(400).json({
@@ -92,6 +123,7 @@ export const createJob = async (req: Request, res: Response) => {
           cronExpression,
           new Date(),
         );
+
         initialNextRunAt = nextRunAt ?? calculatedNextRunAt;
 
         if (!Number.isFinite(new Date(initialNextRunAt).getTime())) {
@@ -107,11 +139,18 @@ export const createJob = async (req: Request, res: Response) => {
       }
     }
 
+    // --------------------------------------------------
+    // Insert job
+    // --------------------------------------------------
+
     const result = await pool.query(
       `
       INSERT INTO jobs (
         name,
+        job_type,
         command,
+        file_path,
+        runtime,
         priority,
         max_attempts,
         schedule_type,
@@ -119,12 +158,15 @@ export const createJob = async (req: Request, res: Response) => {
         cron_expression,
         next_run_at
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
       RETURNING *
       `,
       [
         name,
-        command,
+        jobType,
+        jobType === "COMMAND" ? command : null,
+        uploadedFile ? uploadedFile.path : null,
+        jobType === "FILE" ? runtime.toUpperCase() : null,
         priority,
         maxAttempts,
         scheduleType,
@@ -136,12 +178,22 @@ export const createJob = async (req: Request, res: Response) => {
 
     const job = result.rows[0];
 
+    // --------------------------------------------------
+    // Create log
+    // --------------------------------------------------
+
     await pool.query(
       `
       INSERT INTO job_logs (job_id, event, message)
       VALUES ($1, $2, $3)
       `,
-      [job.id, "CREATED", "Job created"],
+      [
+        job.id,
+        "CREATED",
+        jobType === "FILE"
+          ? `File job created: ${uploadedFile?.originalname}`
+          : "Command job created",
+      ],
     );
 
     return res.status(201).json(job);
@@ -299,6 +351,18 @@ export const cancelJob = async (
       RETURNING *
       `,
       [id],
+    );
+
+    await pool.query(
+      `
+      INSERT INTO job_logs (job_id, event, message)
+      VALUES ($1, $2, $3)
+      `,
+      [
+        id,
+        "CANCELLED",
+        "Job cancelled by user",
+      ],
     );
 
     if (result.rows.length === 0) {

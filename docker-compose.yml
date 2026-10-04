@@ -55,7 +55,9 @@ services:
   # FLOW API
   # =========================================
   api:
-    build: .
+    build: 
+      context: .
+      dockerfile: Dockerfile
     container_name: flow-api
 
     command: ["node", "dist/server.js"]
@@ -67,7 +69,8 @@ services:
 
     ports:
       - "8000:8000"
-
+    volumes:
+      - ./uploads:/app/uploads
     depends_on:
       postgres:
         condition: service_healthy
@@ -79,7 +82,9 @@ services:
   # FLOW SCHEDULER
   # =========================================
   scheduler:
-    build: .
+    build: 
+      context: .
+      dockerfile: Dockerfile
 
     command: ["node", "dist/scheduler.js"]
 
@@ -98,7 +103,10 @@ services:
   # FLOW WORKER 1
   # =========================================
   worker-1:
-    build: .
+    build: 
+      context: .
+      dockerfile: Dockerfile.worker
+    
     container_name: flow-worker-1
 
     command: ["node", "dist/worker.js"]
@@ -107,6 +115,8 @@ services:
       DATABASE_URL: postgresql://flow:flow@postgres:5432/flow
       REDIS_URL: redis://redis:6379
 
+    volumes:
+      - ./uploads:/app/uploads
     depends_on:
       postgres:
         condition: service_healthy
@@ -118,7 +128,9 @@ services:
   # FLOW WORKER 2
   # =========================================
   worker-2:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
     container_name: flow-worker-2
 
     command: ["node", "dist/worker.js"]
@@ -126,6 +138,9 @@ services:
     environment:
       DATABASE_URL: postgresql://flow:flow@postgres:5432/flow
       REDIS_URL: redis://redis:6379
+    
+    volumes:
+      - ./uploads:/app/uploads
 
     depends_on:
       postgres:
@@ -138,7 +153,9 @@ services:
   # FLOW WORKER 3
   # =========================================
   worker-3:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
     container_name: flow-worker-3
 
     command: ["node", "dist/worker.js"]
@@ -146,6 +163,9 @@ services:
     environment:
       DATABASE_URL: postgresql://flow:flow@postgres:5432/flow
       REDIS_URL: redis://redis:6379
+    
+    volumes:
+      - ./uploads:/app/uploads
 
     depends_on:
       postgres:
