@@ -1,6 +1,6 @@
 ﻿# FLOW
 
-FLOW is a distributed job scheduling and execution platform built with Node.js, TypeScript, PostgreSQL, Redis, and BullMQ. It is designed around a simple but practical idea: store job intent in PostgreSQL as the durable source of truth, enqueue execution work through BullMQ/Redis, and have one or more workers perform the actual work outside the web API.
+FLOW is a distributed job scheduling and execution platform built with Node.js, TypeScript, PostgreSQL, Redis, and BullMQ. It is designed around a simple but practical idea: store job intent in PostgreSQL as the durable source of truth, enqueue execution work through BullMQ/Redis, and have three independent worker containers perform the actual work outside the web API.
 
 This repository is not just a toy scheduler. It implements a concrete system in which jobs can be created through HTTP, scheduled for immediate, one-time, or recurring execution, queued for worker consumption, retried on failure, monitored for worker liveness, and recovered if a worker dies mid-execution.
 
@@ -13,7 +13,7 @@ In practice, that means:
 - API requests create jobs without blocking on execution.
 - Scheduling logic decides when a job becomes eligible to run.
 - Redis/BullMQ moves execution work from the database into a real queue.
-- Workers consume jobs and execute shell commands.
+- Three independent workers consume jobs from the shared queue and execute shell commands.
 - PostgreSQL remains the durable state store for job lifecycle and logs.
 - A monitor detects dead workers and requeues recovery work when necessary.
 
@@ -28,7 +28,7 @@ The current codebase already includes:
 - Priority-aware queue ordering
 - PostgreSQL-backed job state and job history
 - BullMQ queue delivery via Redis
-- Multiple worker processes with independent concurrency
+- Three independent Docker worker containers consuming the same BullMQ queue concurrently
 - Worker heartbeats and active monitoring
 - Retry flow with fixed backoff
 - Recurring job next-run scheduling based on cron expressions
@@ -41,18 +41,17 @@ The current codebase already includes:
 flowchart LR
     Client[Client / API Consumer] --> API[Express API\nPOST /jobs\nGET /jobs\nPATCH /jobs/:id]
     API --> PG[(PostgreSQL\njobs, job_logs, workers)]
-    API --> Scheduler[Scheduler Process]
     Scheduler --> PG
     Scheduler --> Queue[Redis + BullMQ\nflow-jobs]
-    Queue --> Worker1[Worker Process 1]
-    Queue --> Worker2[Worker Process 2]
-    Queue --> WorkerN[Worker Process N]
+    Queue --> Worker1[flow-worker-1]
+    Queue --> Worker2[flow-worker-2]
+    Queue --> Worker3[flow-worker-3]
     Worker1 --> OS[Shell / OS Command]
     Worker2 --> OS
-    WorkerN --> OS
+    Worker3 --> OS
     Worker1 --> PG
     Worker2 --> PG
-    WorkerN --> PG
+    Worker3 --> PG
     Monitor[Worker Monitor] --> PG
     Monitor --> Queue
 ```
@@ -73,8 +72,8 @@ The architecture intentionally separates responsibilities:
 | PostgreSQL | Source of truth for jobs and logs | Keeps state durable, queryable, and auditable |
 | Scheduler | Polls pending jobs and enqueues them | Moves jobs from database state to BullMQ queue |
 | BullMQ + Redis | Queue, retry, and concurrency coordination | Decouples producers from consumers and provides job distribution |
-| Worker process | Executes `job.command` | Isolates execution from HTTP handling and allows horizontal scaling |
-| Worker monitor | Detects dead workers and requeues work | Recovers from crashes without losing job ownership entirely |
+| Three worker containers | Each runs the same worker service and executes `job.command` from the shared queue | Separates execution from HTTP handling and allows the three consumers to process jobs concurrently |
+| Worker monitor | Detects stale heartbeats from any worker and checks its running jobs | Coordinates recovery after a worker process disappears |
 
 ## Database and state model
 
@@ -245,13 +244,13 @@ sequenceDiagram
     participant DB as PostgreSQL
     participant Scheduler as Scheduler
     participant Queue as BullMQ / Redis
-    participant Worker as Worker
+    participant Worker as One of three workers
 
     API->>DB: INSERT jobs (schedule_type='RECURRING', cron_expression, next_run_at)
     Scheduler->>DB: Poll jobs where next_run_at <= NOW()
     Scheduler->>DB: status = QUEUED
     Scheduler->>Queue: add execute-job
-    Queue-->>Worker: dispatch job
+    Queue-->>Worker: dispatch job to an available worker
     Worker->>DB: UPDATE status = RUNNING
     Worker->>Worker: exec(job.command)
     alt success
@@ -398,7 +397,7 @@ flowchart LR
 
 ## Worker execution model
 
-Worker startup is in `src/worker.ts`. The worker starts a BullMQ `Worker` with a configurable concurrency of 3:
+Worker startup is in `src/worker.ts`. Each worker starts a BullMQ `Worker` with concurrency set to 3:
 
 ```ts
 const worker = new Worker(
@@ -415,7 +414,9 @@ const worker = new Worker(
 );
 ```
 
-This means each Node process can handle up to three jobs concurrently. Multiple worker processes can run independently, allowing the same queue to be processed across more than one machine or container.
+The Docker Compose deployment runs three independent worker containers—`flow-worker-1`, `flow-worker-2`, and `flow-worker-3`—each executing the same `src/worker.ts` entry point and consuming the shared `flow-jobs` queue. Each worker process has `concurrency: 3`, so the three configured workers can collectively run up to nine jobs concurrently, subject to available resources and queued work. The workers are separate processes, not a single worker instance replicated internally.
+
+Running `npm run worker` locally starts one worker process. It does not start all three Compose workers.
 
 ### Worker execution details
 
@@ -431,7 +432,7 @@ When a job is picked up, the worker:
 
 ## Worker heartbeat and monitoring
 
-Each worker gets a unique ID using the host name plus a UUID fragment. It registers itself in PostgreSQL and updates a `last_heartbeat` every 5 seconds.
+Each of the three worker processes gets its own unique ID using the host name plus a UUID fragment (unless `WORKER_ID` is explicitly set). Every worker registers its identity in PostgreSQL and updates its own `last_heartbeat` every 5 seconds. The three Compose container names are `flow-worker-1`, `flow-worker-2`, and `flow-worker-3`; the default database `worker_id` is generated by the process and is not explicitly set to those container names in Compose.
 
 ```ts
 export const startHeartbeat = () => {
@@ -448,7 +449,7 @@ export const startHeartbeat = () => {
 };
 ```
 
-The monitor runs separately via `src/monitor.ts` and `src/services/worker_monitor.service.ts`. It marks workers offline if they fail to heartbeat within 15 seconds.
+The single monitor process runs separately via `src/monitor.ts` and `src/services/worker_monitor.service.ts`. It checks all worker records and marks any worker offline if that worker fails to heartbeat within 15 seconds. When one of the three workers is marked offline, it inspects jobs recorded as running under that worker ID and uses BullMQ state to decide whether recovery is needed.
 
 ```mermaid
 flowchart TD
@@ -461,7 +462,7 @@ flowchart TD
     G -- No --> I[Requeue job or mark FAILED if attempts exhausted]
 ```
 
-This is the project’s crash-recovery mechanism. If a worker disappears while holding a running job, the monitor detects the stale worker and requeues the work if necessary.
+This is the project’s crash-recovery mechanism for all three workers. If any worker disappears while holding a running job, the monitor detects its stale heartbeat and requeues the work if necessary.
 
 ## Job logs and execution state
 
@@ -534,8 +535,16 @@ This starts:
 - Redis on `localhost:6379`
 - API on `localhost:8000`
 - Scheduler process
-- Worker process
+- Three independent worker containers: `flow-worker-1`, `flow-worker-2`, and `flow-worker-3`
 - Monitor process
+
+The three Compose worker services are `worker-1`, `worker-2`, and `worker-3`; their container names are `flow-worker-1`, `flow-worker-2`, and `flow-worker-3`. All run `node dist/worker.js`, connect to the same Redis queue and PostgreSQL database, and send independent heartbeats. Each has BullMQ concurrency set to 3.
+
+Initialize the schema once before using the API. With the Compose PostgreSQL port published locally and `DATABASE_URL` pointing to `localhost:5432`, run:
+
+```bash
+npm run db:init
+```
 
 ### Local development commands
 
@@ -563,11 +572,13 @@ Start the scheduler:
 npm run scheduler
 ```
 
-Start the worker:
+Start one worker process for local development:
 
 ```bash
 npm run worker
 ```
+
+To run the full Docker deployment with all three workers instead, use `docker compose up -d --build` as above. Do not also start local worker processes unless additional consumers are intended.
 
 Start the monitor:
 
@@ -622,9 +633,9 @@ BullMQ is used as the queue transport. This gives the project real work distribu
 
 The scheduler runs a `setInterval` every 5 seconds and checks for ready jobs. This is a simple and effective pattern for a proof-of-concept system, but it is not as event-driven or low-latency as a production scheduler using more advanced queue orchestration.
 
-### Worker concurrency per process
+### Three worker containers and per-process concurrency
 
-Each worker process runs with `concurrency: 3`, which allows multiple jobs to execute in parallel inside a single worker instance while still keeping the system simple. This is enough to demonstrate scale-out behavior without introducing more explicit resource quotas or orchestration policies.
+Compose defines three independent worker services, each running the same worker implementation with `concurrency: 3`. Together they can process up to nine jobs at a time when enough work is queued and system resources are available. This demonstrates concurrent queue consumption without introducing autoscaling or per-job resource quotas.
 
 ### Process-level command execution
 
@@ -685,11 +696,9 @@ It is intentionally simple, but it demonstrates the core building blocks of a se
 ```bash
 docker compose up -d --build
 npm run db:init
-npm run dev
-npm run scheduler
-npm run worker
-npm run monitor
 ```
+
+This starts the API, scheduler, monitor, and all three workers in Compose. For local development, `npm run dev`, `npm run scheduler`, `npm run worker`, and `npm run monitor` are separate commands/processes; `npm run worker` starts one worker instance only.
 
 Then interact with the API at `http://localhost:8000`.
 

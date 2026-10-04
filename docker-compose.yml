@@ -1,4 +1,5 @@
 name: flow
+
 services:
 
   # =========================================
@@ -22,6 +23,13 @@ services:
     volumes:
       - flow_postgres_data:/var/lib/postgresql/data
 
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flow -d flow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
 
   # =========================================
   # Redis
@@ -35,6 +43,12 @@ services:
 
     volumes:
       - flow_redis_data:/data
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
 
   # =========================================
@@ -55,8 +69,10 @@ services:
       - "8000:8000"
 
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
 
   # =========================================
@@ -72,15 +88,18 @@ services:
       REDIS_URL: redis://redis:6379
 
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
 
   # =========================================
-  # FLOW WORKER
+  # FLOW WORKER 1
   # =========================================
-  worker:
+  worker-1:
     build: .
+    container_name: flow-worker-1
 
     command: ["node", "dist/worker.js"]
 
@@ -89,8 +108,50 @@ services:
       REDIS_URL: redis://redis:6379
 
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+
+  # =========================================
+  # FLOW WORKER 2
+  # =========================================
+  worker-2:
+    build: .
+    container_name: flow-worker-2
+
+    command: ["node", "dist/worker.js"]
+
+    environment:
+      DATABASE_URL: postgresql://flow:flow@postgres:5432/flow
+      REDIS_URL: redis://redis:6379
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+
+  # =========================================
+  # FLOW WORKER 3
+  # =========================================
+  worker-3:
+    build: .
+    container_name: flow-worker-3
+
+    command: ["node", "dist/worker.js"]
+
+    environment:
+      DATABASE_URL: postgresql://flow:flow@postgres:5432/flow
+      REDIS_URL: redis://redis:6379
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
 
   # =========================================
@@ -106,8 +167,10 @@ services:
       REDIS_URL: redis://redis:6379
 
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
 
 # =========================================
@@ -115,7 +178,7 @@ services:
 # =========================================
 volumes:
   flow_postgres_data:
-    name: poc_flow_postgres_data
+    name: flow_postgres_data
 
   flow_redis_data:
-    name: poc_flow_redis_data
+    name: flow_redis_data

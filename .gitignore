@@ -16,6 +16,9 @@ logs/
 # Runtime / temporary files
 *.tmp
 *.temp
+*.pid
+*.pid.lock
+pids/
 
 # OS files
 .DS_Store
@@ -36,6 +39,8 @@ test-folder/
 .prisma/
 
 # Misc
+.npm/
+.cache/
 npm-debug.log*
 yarn-debug.log*
 pnpm-debug.log*
