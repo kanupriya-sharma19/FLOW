@@ -3,18 +3,20 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "postinstall": "prisma skills sync || exit 0",
-    "dev": "tsx watch src/server.ts",
-    "build": "tsc",
-    "start": "node dist/server.js",
-    "db:init": "tsx src/init-db.ts",
-    "scheduler": "tsx watch src/scheduler.ts",
-    "start:scheduler": "node dist/scheduler.js",
-    "worker": "tsx watch src/worker.ts",
-    "start:worker": "node dist/worker.js",
-    "monitor": "tsx watch src/monitor.ts",
-    "start:monitor": "node dist/monitor.js"
+
+  "dev": "tsx watch src/server.ts",
+  "dev:scheduler": "tsx watch src/scheduler/scheduler.ts",
+  "dev:worker": "tsx watch src/worker/worker.ts",
+  "dev:monitor": "tsx watch src/worker/monitor.ts",
+
+  "build": "tsc",
+
+  "start": "node dist/server.js",
+  "start:scheduler": "node dist/scheduler/scheduler.js",
+  "start:worker": "node dist/worker/worker.js",
+  "start:monitor": "node dist/worker/monitor.js",
+
+  "db:init": "tsx src/init-db.ts"
   },
   "type": "module",
   "keywords": [],

@@ -1,11 +1,9 @@
 import type { Request, Response } from "express";
 import { pool } from "../db.js";
-import { queuePendingJobs } from "../services/scheduler.service.js";
-import {
-  getBullMQExecutionId,
-  jobQueue,
-} from "../queues/job.queue.js";
-import { calculateNextRun } from "../services/cron.service.js";
+import { queuePendingJobs } from "../scheduler/scheduler.service.js";
+import { getBullMQExecutionId, jobQueue } from "../queues/job.queue.js";
+import { calculateNextRun } from "../jobs/job_cron.service.js";
+import { addJobLog } from "../jobs/job_log.service.js";
 
 // CREATE
 export const createJob = async (req: Request, res: Response) => {
@@ -130,8 +128,7 @@ export const createJob = async (req: Request, res: Response) => {
           throw new Error("nextRunAt must be a valid date");
         }
       } catch (error) {
-        const message =
-          error instanceof Error ? error.message : String(error);
+        const message = error instanceof Error ? error.message : String(error);
 
         return res.status(400).json({
           error: `Invalid recurring schedule: ${message}`,
@@ -182,18 +179,12 @@ export const createJob = async (req: Request, res: Response) => {
     // Create log
     // --------------------------------------------------
 
-    await pool.query(
-      `
-      INSERT INTO job_logs (job_id, event, message)
-      VALUES ($1, $2, $3)
-      `,
-      [
-        job.id,
-        "CREATED",
-        jobType === "FILE"
-          ? `File job created: ${uploadedFile?.originalname}`
-          : "Command job created",
-      ],
+    await addJobLog(
+      job.id,
+      "CREATED",
+      jobType === "FILE"
+        ? `File job created: ${uploadedFile?.originalname}`
+        : "Command job created",
     );
 
     return res.status(201).json(job);
@@ -358,12 +349,10 @@ export const cancelJob = async (
       INSERT INTO job_logs (job_id, event, message)
       VALUES ($1, $2, $3)
       `,
-      [
-        id,
-        "CANCELLED",
-        "Job cancelled by user",
-      ],
+      [id, "CANCELLED", "Job cancelled by user"],
     );
+
+    await addJobLog(id, "CANCELLED", `Job cancelled by user`);
 
     if (result.rows.length === 0) {
       const jobResult = await pool.query(

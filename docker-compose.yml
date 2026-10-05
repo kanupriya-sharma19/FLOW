@@ -86,7 +86,7 @@ services:
       context: .
       dockerfile: Dockerfile
 
-    command: ["node", "dist/scheduler.js"]
+    command: ["node", "dist/scheduler/scheduler.js"]
 
     environment:
       DATABASE_URL: postgresql://flow:flow@postgres:5432/flow
@@ -109,7 +109,7 @@ services:
     
     container_name: flow-worker-1
 
-    command: ["node", "dist/worker.js"]
+    command: ["node", "dist/worker/worker.js"]
 
     environment:
       DATABASE_URL: postgresql://flow:flow@postgres:5432/flow
@@ -133,7 +133,7 @@ services:
       dockerfile: Dockerfile.worker
     container_name: flow-worker-2
 
-    command: ["node", "dist/worker.js"]
+    command: ["node", "dist/worker/worker.js"]
 
     environment:
       DATABASE_URL: postgresql://flow:flow@postgres:5432/flow
@@ -158,7 +158,7 @@ services:
       dockerfile: Dockerfile.worker
     container_name: flow-worker-3
 
-    command: ["node", "dist/worker.js"]
+    command: ["node", "dist/worker/worker.js"]
 
     environment:
       DATABASE_URL: postgresql://flow:flow@postgres:5432/flow
@@ -180,7 +180,7 @@ services:
   monitor:
     build: .
 
-    command: ["node", "dist/monitor.js"]
+    command: ["node", "dist/worker/monitor.js"]
 
     environment:
       DATABASE_URL: postgresql://flow:flow@postgres:5432/flow

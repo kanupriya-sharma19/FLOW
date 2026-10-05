@@ -23,7 +23,7 @@
 */
 
 import dotenv from "dotenv";
-import { startWorker } from "./services/worker.service.js";
+import { startWorker } from "./worker.service.js";
 
 dotenv.config();
 

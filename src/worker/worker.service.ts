@@ -47,7 +47,6 @@
 */
 import { pool } from "../db.js";
 import { Worker } from "bullmq";
-import { Redis } from "ioredis";
 import dotenv from "dotenv";
 import {
   workerId,
@@ -56,7 +55,7 @@ import {
 } from "./worker_heartbeat.service.js";
 import { connection } from "../queues/job.queue.js";
 
-import { processJob } from "./job_processor.service.js";
+import { processJob } from "../jobs/job_processor.service.js";
 
 dotenv.config();
 

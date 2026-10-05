@@ -1,8 +1,5 @@
 import { pool } from "../db.js";
-import {
-  getBullMQExecutionId,
-  jobQueue,
-} from "../queues/job.queue.js";
+import { getBullMQExecutionId, jobQueue } from "../queues/job.queue.js";
 
 const HEARTBEAT_TIMEOUT_SECONDS = 15;
 const MONITOR_INTERVAL_MS = 5000;
@@ -56,8 +53,7 @@ const recoverWorkerJobs = async (deadWorkerId: string) => {
        * put the job back into the queue.
        */
 
-      const remainingAttempts =
-        job.max_attempts - job.attempts;
+      const remainingAttempts = job.max_attempts - job.attempts;
 
       if (remainingAttempts <= 0) {
         await pool.query(
@@ -73,9 +69,7 @@ const recoverWorkerJobs = async (deadWorkerId: string) => {
           [job.id],
         );
 
-        console.log(
-          `[Worker Monitor] Job ${job.id} permanently FAILED`,
-        );
+        console.log(`[Worker Monitor] Job ${job.id} permanently FAILED`);
 
         continue;
       }
@@ -109,14 +103,9 @@ const recoverWorkerJobs = async (deadWorkerId: string) => {
         [job.id],
       );
 
-      console.log(
-        `[Worker Monitor] Requeued crashed job: ${job.id}`,
-      );
+      console.log(`[Worker Monitor] Requeued crashed job: ${job.id}`);
     } catch (error) {
-      console.error(
-        `[Worker Monitor] Failed to recover job ${job.id}:`,
-        error,
-      );
+      console.error(`[Worker Monitor] Failed to recover job ${job.id}:`, error);
     }
   }
 };
@@ -146,10 +135,7 @@ export const checkWorkerHealth = async () => {
       await recoverWorkerJobs(worker.worker_id);
     }
   } catch (error) {
-    console.error(
-      "[Worker Monitor] Error checking worker health:",
-      error,
-    );
+    console.error("[Worker Monitor] Error checking worker health:", error);
   }
 };
 
