@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import jobRoutes from "./routes/job.routes.js";
+import workerRoutes from "./routes/workers.routes.js";
 
 const app = express();
 
@@ -14,4 +15,5 @@ app.get("/health", (_req, res) => {
   });
 });
 app.use("/jobs", jobRoutes);
+app.use("/workers", workerRoutes);
 export default app;

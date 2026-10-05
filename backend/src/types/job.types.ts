@@ -1,5 +1,3 @@
-// src/types/job.types.ts
-
 export type JobType = "COMMAND" | "FILE";
 
 export type JobRuntime =

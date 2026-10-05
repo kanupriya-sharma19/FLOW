@@ -9,6 +9,8 @@ import {
   deleteJob,
   cancelJob,
   queueJobs,
+  getJobExecutions,
+  getJobLogs,
 } from "../controllers/job.controller.js";
 
 const router = Router();
@@ -22,6 +24,10 @@ router.post("/", upload.single("file"), createJob);
 router.get("/", getJobs);
 
 router.post("/queue", queueJobs);
+
+router.get("/:id/executions", getJobExecutions);
+
+router.get("/:id/logs", getJobLogs);
 
 router.get("/:id", getJob);
 

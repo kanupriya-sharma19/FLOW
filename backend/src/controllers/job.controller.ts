@@ -248,6 +248,56 @@ export const getJob = async (req: Request, res: Response) => {
   }
 };
 
+// READ JOB EXECUTIONS
+export const getJobExecutions = async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+
+    const result = await pool.query(
+      `
+      SELECT *
+      FROM job_executions
+      WHERE job_id = $1
+      ORDER BY started_at DESC
+      `,
+      [id],
+    );
+
+    return res.json(result.rows);
+  } catch (error) {
+    console.error("Failed to fetch job executions:", error);
+
+    return res.status(500).json({
+      error: "Failed to fetch job executions",
+    });
+  }
+};
+
+// READ JOB LOGS
+export const getJobLogs = async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+
+    const result = await pool.query(
+      `
+      SELECT *
+      FROM job_logs
+      WHERE job_id = $1
+      ORDER BY created_at ASC
+      `,
+      [id],
+    );
+
+    return res.json(result.rows);
+  } catch (error) {
+    console.error("Failed to fetch job logs:", error);
+
+    return res.status(500).json({
+      error: "Failed to fetch job logs",
+    });
+  }
+};
+
 // UPDATE
 export const updateJob = async (req: Request, res: Response) => {
   try {
