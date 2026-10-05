@@ -2,7 +2,7 @@
 
 FLOW is a distributed job scheduling and execution platform built with Node.js, TypeScript, PostgreSQL, Redis, and BullMQ. It is designed around a simple but practical idea: store job intent in PostgreSQL as the durable source of truth, enqueue execution work through BullMQ/Redis, and have three independent worker containers perform the actual work outside the web API.
 
-This repository is not just a toy scheduler. It implements a concrete system in which jobs can be created through HTTP, scheduled for immediate, one-time, or recurring execution, submitted as shell commands or uploaded Python files, queued for worker consumption, retried on failure, monitored for worker liveness, and recovered if a worker dies mid-execution.
+This repository is not just a toy scheduler. It implements a concrete system in which jobs can be created through HTTP, scheduled for immediate, one-time, or recurring execution, submitted as shell commands or uploaded Python/Node.js scripts, queued for worker consumption, retried on failure, monitored for worker liveness, and recovered if a worker dies mid-execution.
 
 ## Why FLOW exists
 
@@ -13,7 +13,7 @@ In practice, that means:
 - API requests create jobs without blocking on execution.
 - Scheduling logic decides when a job becomes eligible to run.
 - Redis/BullMQ moves execution work from the database into a real queue.
-- Three independent workers consume jobs from the shared queue and execute either shell commands or uploaded Python files.
+- Three independent workers consume jobs from the shared queue and execute either shell commands or uploaded Python/Node.js files.
 - PostgreSQL remains the durable state store for job lifecycle and logs.
 - A monitor detects dead workers and requeues recovery work when necessary.
 
@@ -26,7 +26,7 @@ The current codebase already includes:
 - HTTP job creation, listing, lookup, update, deletion, and cancellation
 - Immediate, one-time, and recurring job scheduling
 - Job submission as either a shell command or an uploaded file job
-- Python job support via uploaded `.py` files and the `runtime` field
+- Python and Node.js job support via uploaded files and the `runtime` field (`PYTHON` or `NODE`)
 - Priority-aware queue ordering
 - PostgreSQL-backed job state and job history
 - Per-attempt execution records, including worker, attempt number, output, exit code, timestamps, and error
@@ -49,7 +49,7 @@ flowchart LR
     Queue --> Worker1[flow-worker-1]
     Queue --> Worker2[flow-worker-2]
     Queue --> Worker3[flow-worker-3]
-    Worker1 --> OS[Shell / OS Command\nPython interpreter for uploaded files]
+    Worker1 --> OS[Shell / OS Command\nPython or Node.js for uploaded files]
     Worker2 --> OS
     Worker3 --> OS
     Worker1 --> PG
@@ -75,12 +75,12 @@ The architecture intentionally separates responsibilities:
 | PostgreSQL | Source of truth for jobs, logs, workers, and execution attempts | Keeps state durable, queryable, and auditable |
 | Scheduler | Polls pending jobs and enqueues them | Moves jobs from database state to BullMQ queue |
 | BullMQ + Redis | Queue, retry, and concurrency coordination | Decouples producers from consumers and provides job distribution |
-| Three worker containers | Each runs the same worker service and executes either `job.command` or a Python file from the shared queue | Separates execution from HTTP handling and allows the three consumers to process jobs concurrently |
+| Three worker containers | Each runs the same worker service and executes either `job.command` or a Python/Node.js file from the shared queue | Separates execution from HTTP handling and allows the three consumers to process jobs concurrently |
 | Worker monitor | Detects stale heartbeats from any worker and checks its running jobs | Coordinates recovery after a worker process disappears |
 
 ## Database and state model
 
-The project initializes PostgreSQL tables in `src/init-db.ts`. The important tables are:
+The project initializes PostgreSQL tables in `src/init_db.ts`. The important tables are:
 
 - `jobs`: current job state, including `job_type`, `file_path`, and `runtime` for uploaded file jobs
 - `job_logs`: event history for each job
@@ -157,7 +157,7 @@ The `jobs` table stores:
 - `job_type`: `COMMAND` for shell commands or `FILE` for uploaded script files
 - `command`: command string for `COMMAND` jobs
 - `file_path`: saved upload path for `FILE` jobs
-- `runtime`: runtime for file jobs, currently `PYTHON` in the codebase
+- `runtime`: runtime for file jobs: `PYTHON` or `NODE`
 - `status`: `PENDING`, `QUEUED`, `RUNNING`, `COMPLETED`, `FAILED`, `CANCELLED`
 - `schedule_type`: `IMMEDIATE`, `ONCE`, or `RECURRING`
 - `scheduled_at`: when a one-time job should run
@@ -168,7 +168,7 @@ The `jobs` table stores:
 - `worker_id`: last worker that claimed the job
 - `error`: last failure message
 
-`job_logs` records the lifecycle events of each job, such as `CREATED`, `QUEUED`, `STARTED`, `COMPLETED`, `FAILED`, and `CANCELLED`.
+`job_logs` records the lifecycle events of each job, such as `CREATED`, `QUEUED`, `WORKER_ASSIGNED`, `STARTED`, `COMPLETED`, `FAILED`, and `CANCELLED`.
 
 `job_executions` keeps per-attempt history separately from the current `jobs` row. The worker inserts a `RUNNING` record when it starts an attempt and updates that record to `COMPLETED` or `FAILED` with its completion timestamp, exit code, stdout, stderr, and error text. The table is created, with indexes on `job_id` and `worker_id`, by `npm run db:init`. There is no API endpoint for querying execution records.
 
@@ -232,7 +232,19 @@ curl -X POST http://localhost:8000/jobs \
   -F "file=@./test_job.py"
 ```
 
-This is how the API currently works in practice: the route uses `multer({ dest: "uploads/" })` and the uploaded file is submitted under the multipart form field named `file`. File jobs do not include a `command`; instead, the database stores the uploaded file path and runtime. The worker later rehydrates that file and executes it using the configured runtime.
+This is how the API currently works in practice: the route uses `multer({ dest: "uploads/" })` and the uploaded file is submitted under the multipart form field named `file`. File jobs do not include a `command`; instead, the database stores the uploaded file path and runtime. The worker executes the file with `python3` for `PYTHON` jobs or `node` for `NODE` jobs.
+
+Node.js file job example:
+
+```bash
+curl -X POST http://localhost:8000/jobs \
+  -F "name=node-job" \
+  -F "runtime=NODE" \
+  -F "priority=10" \
+  -F "scheduleType=IMMEDIATE" \
+  -F "maxAttempts=3" \
+  -F "file=@./test_job.js"
+```
 
 Example response shape for a file job:
 
@@ -283,21 +295,9 @@ The controller sets:
 
 - `job_type = "FILE"` whenever an uploaded file exists
 - `file_path` to the saved upload path in `uploads/`
-- `runtime` to the submitted runtime value (for the current implementation, `runtime` is required and the worker only supports `PYTHON`)
+- `runtime` to the submitted runtime value (`runtime` is required for file jobs; the worker supports `PYTHON` and `NODE`)
 
-The worker executes these jobs by calling:
-
-```ts
-spawn("python", [job.file_path], {
-  shell: false,
-  env: {
-    ...process.env,
-    FLOW_ATTEMPT: String(job.attempts),
-  },
-});
-```
-
-In other words, uploaded Python files are executed directly on the worker machine using the system `python` binary. This is a file-based execution path distinct from the shell-command execution path, but it uses the same scheduler, retry, and state tracking pipeline.
+The worker executes uploaded scripts directly on the worker machine using `python3` for `PYTHON` jobs or `node` for `NODE` jobs, with `shell: false`. `FLOW_ATTEMPT` is provided in the child process environment. Command and script subprocesses are terminated after a fixed 30-second timeout. File jobs use the same scheduler, retry, and state tracking pipeline as command jobs.
 
 ### Immediate jobs
 
@@ -330,7 +330,7 @@ sequenceDiagram
     Scheduler->>Queue: add execute-job
     Queue-->>Worker: dispatch job to an available worker
     Worker->>DB: UPDATE status = RUNNING
-    Worker->>Worker: exec(job.command)
+    Worker->>Worker: Execute command or uploaded script
     alt success
         Worker->>DB: status = PENDING, next_run_at = next execution timestamp
         Worker->>DB: INSERT job_logs (COMPLETED)
@@ -342,7 +342,7 @@ sequenceDiagram
 
 ## Scheduler and queue flow
 
-The scheduler process runs `src/scheduler.ts`, which calls `startScheduler()` from `src/services/scheduler.service.ts`.
+The scheduler process runs `src/scheduler/scheduler.ts`, which calls `startScheduler()` from `src/scheduler/scheduler.service.ts`.
 
 It polls every 5 seconds and applies this logic:
 
@@ -422,28 +422,22 @@ flowchart TD
     E --> F[Add BullMQ job to flow-jobs]
     F --> G[Worker picks job]
     G --> H[status = RUNNING\nattempts = attempts + 1]
-    H --> I[Execute job.command]
-    I --> J{Command succeeded?}
+    H --> I[Execute command or uploaded script]
+    I --> J{Execution succeeded?}
     J -- Yes --> K[Recurring?]
     K -- Yes --> L[status = PENDING\nnext_run_at = next cron occurrence]
     K -- No --> M[status = COMPLETED]
-    J -- No --> N{attempts < max_attempts?}
-    N -- Yes --> O[status = QUEUED\nBullMQ retry with backoff]
+    J -- No --> N{BullMQ attempts remain?}
+    N -- Yes --> O[Retry after 2s\nDB retains latest state/error]
+    O --> G
     N -- No --> P[status = FAILED]
 ```
 
 ## Retry and backoff behavior
 
-The retry logic is split between PostgreSQL state and BullMQ behavior.
+The retry logic is split between PostgreSQL execution history and BullMQ behavior. On failure, `handleJobFailure()` stores the error and clears the worker assignment, then rethrows; it does not set the database job back to `QUEUED` between retries. BullMQ schedules the retry, and the next worker attempt marks the database job `RUNNING` again.
 
-When a worker catches a command or Python file failure in `src/services/job_processor.service.ts`, it:
-
-1. Inserts a `FAILED` log entry with the execution error
-2. Checks whether `job.attempts < job.max_attempts`
-3. Updates the database to `QUEUED` and clears the worker assignment
-4. Re-throws the error so BullMQ can complete its retry policy
-
-The same retry path is used for uploaded Python jobs: if the Python process exits non-zero or the file cannot be executed, the worker records the stderr/output, stores the exit code, and leaves the job in `QUEUED` when retries remain.
+When a command or uploaded script fails in `src/jobs/job_processor.service.ts`, the worker updates that attempt's `job_executions` record with the error, captured output, and exit code when available, records the failure in `job_logs`, stores the latest error on the job, and re-throws the error so BullMQ can apply its retry policy. Non-zero exits, spawn errors, and execution timeouts all follow this path.
 
 BullMQ is configured with:
 
@@ -456,28 +450,23 @@ backoff: {
 removeOnComplete: true,
 ```
 
-This means:
-
-- the PostgreSQL job row tracks the logical retry state
-- BullMQ decides when to retry based on the configured attempts and fixed backoff
-- the worker leaves the job in `QUEUED` for the scheduler to pick it again after the worker fails and the queue replays it
+The scheduler configures BullMQ with `job.max_attempts` attempts, a fixed 2-second backoff, and removal of completed queue entries. PostgreSQL retains the job's latest state/error and each attempt's result in `job_executions`; when all attempts are exhausted, the worker's BullMQ failure handler marks the database job `FAILED`.
 
 ### Retry flow
 
 ```mermaid
 flowchart LR
-    A[Worker runs command] --> B{Command succeeds?}
+    A[Worker runs command or script] --> B{Execution succeeds?}
     B -- No --> C[Update job error + logs]
-    C --> D{Current attempts < max_attempts?}
-    D -- Yes --> E[status = QUEUED]
-    E --> F[BullMQ retry after 2s fixed backoff]
-    F --> G[Worker picks job again]
+    C --> D{BullMQ attempts remain?}
+    D -- Yes --> E[BullMQ retry after 2s fixed backoff]
+    E --> F[Worker picks job again]
     D -- No --> H[status = FAILED]
 ```
 
 ## Worker execution model
 
-Worker startup is in `src/worker.ts`. Each worker starts a BullMQ `Worker` with concurrency set to 3:
+Worker startup is in `src/worker/worker.ts`; it calls `startWorker()` from `src/worker/worker.service.ts`. Each worker starts a BullMQ `Worker` with concurrency set to 3:
 
 ```ts
 const worker = new Worker(
@@ -494,9 +483,9 @@ const worker = new Worker(
 );
 ```
 
-The Docker Compose deployment runs three independent worker containers—`flow-worker-1`, `flow-worker-2`, and `flow-worker-3`—each executing the same `src/worker.ts` entry point and consuming the shared `flow-jobs` queue. Each worker process has `concurrency: 3`, so the three configured workers can collectively run up to nine jobs concurrently, subject to available resources and queued work. The workers are separate processes, not a single worker instance replicated internally.
+The Docker Compose deployment runs three independent worker containers—`flow-worker-1`, `flow-worker-2`, and `flow-worker-3`—each executing the same `src/worker/worker.ts` entry point and consuming the shared `flow-jobs` queue. Each worker process has `concurrency: 3`, so the three configured workers can collectively run up to nine jobs concurrently, subject to available resources and queued work. The workers are separate processes, not a single worker instance replicated internally.
 
-Running `npm run worker` locally starts one worker process. It does not start all three Compose workers.
+Running `npm run dev:worker` locally starts one worker process. It does not start all three Compose workers.
 
 ### Worker execution details
 
@@ -509,12 +498,12 @@ When a job is picked up, the worker:
 5. Creates a `job_executions` record for the attempt
 6. Executes the right runtime for the job type:
    - `COMMAND`: runs `job.command` with `child_process.spawn(..., { shell: true })`
-   - `FILE`: validates `job.file_path` and `job.runtime`, then runs `python job.file_path` with `shell: false`
+   - `FILE`: runs `python3 job.file_path` for `PYTHON` or `node job.file_path` for `NODE`, with `shell: false`
 7. Streams stdout/stderr to the worker logs and stores the captured output plus exit code in `job_executions`
 8. Updates the execution record and job state in PostgreSQL on success or failure
 9. Re-throws on failure so BullMQ handles the retry backoff
 
-This means Python jobs follow the exact same lifecycle and retry path as shell-command jobs: `PENDING` → `QUEUED` → `RUNNING` → `job_executions` record → success or failure → `QUEUED` again if retries remain, otherwise `FAILED`.
+Python and Node.js jobs follow the same lifecycle and retry path as shell-command jobs: `PENDING` → `QUEUED` → `RUNNING` → `job_executions` record → success or failure → BullMQ retry if attempts remain, otherwise `FAILED`. Command and script subprocesses have a fixed 30-second timeout.
 
 ## Worker heartbeat and monitoring
 
@@ -535,7 +524,7 @@ export const startHeartbeat = () => {
 };
 ```
 
-The single monitor process runs separately via `src/monitor.ts` and `src/services/worker_monitor.service.ts`. It checks all worker records and marks any worker offline if that worker fails to heartbeat within 15 seconds. When one of the three workers is marked offline, it inspects jobs recorded as running under that worker ID and uses BullMQ state to decide whether recovery is needed.
+The single monitor process runs separately via `src/worker/monitor.ts` and `src/worker/worker_monitor.service.ts`. It checks all worker records and marks any worker offline if that worker fails to heartbeat within 15 seconds. When one of the three workers is marked offline, it inspects jobs recorded as running under that worker ID and uses BullMQ state to decide whether recovery is needed.
 
 ```mermaid
 flowchart TD
@@ -556,6 +545,7 @@ The worker logs each stage of execution. The logs are written to the `job_logs` 
 
 - `CREATED`
 - `QUEUED`
+- `WORKER_ASSIGNED`
 - `STARTED`
 - `COMPLETED`
 - `FAILED`
@@ -567,7 +557,7 @@ The `jobs` row remains the durable current state machine. For example:
 
 - `PENDING` means the job has been created but not yet eligible to queue
 - `QUEUED` means the scheduler has moved it into the BullMQ-ready state
-- `RUNNING` means a worker claimed it and is executing `job.command`
+- `RUNNING` means a worker claimed it and is executing the command or uploaded script
 - `COMPLETED` means execution succeeded
 - `FAILED` means maximum retry attempts were exhausted
 - `CANCELLED` means the job was cancelled before execution or while still waiting in the queue
@@ -585,22 +575,33 @@ FLOW/
 ├── src/
 │   ├── app.ts
 │   ├── db.ts
-│   ├── init-db.ts
-│   ├── monitor.ts
-│   ├── scheduler.ts
+│   ├── init_db.ts
 │   ├── server.ts
-│   ├── worker.ts
 │   ├── controllers/
 │   │   └── job.controller.ts
+│   ├── executors/
+│   │   ├── command.executor.ts
+│   │   └── script.executor.ts
+│   ├── jobs/
+│   │   ├── job_cron.service.ts
+│   │   ├── job_execution.service.ts
+│   │   ├── job_lifecycle.service.ts
+│   │   ├── job_log.service.ts
+│   │   ├── job_processor.service.ts
+│   │   └── job_query.service.ts
 │   ├── queues/
 │   │   └── job.queue.ts
 │   ├── routes/
 │   │   └── job.routes.ts
-│   └── services/
-│       ├── cron.service.ts
-│       ├── job_processor.service.ts
-│       ├── scheduler.service.ts
+│   ├── scheduler/
+│   │   ├── scheduler.service.ts
+│   │   └── scheduler.ts
+│   ├── types/
+│   │   └── job.types.ts
+│   └── worker/
+│       ├── monitor.ts
 │       ├── worker.service.ts
+│       ├── worker.ts
 │       ├── worker_heartbeat.service.ts
 │       └── worker_monitor.service.ts
 ├── dist/
@@ -626,9 +627,9 @@ This starts:
 - Three independent worker containers: `flow-worker-1`, `flow-worker-2`, and `flow-worker-3`
 - Monitor process
 
-The worker services are intentionally built from a dedicated `Dockerfile.worker` image that installs `python3` so uploaded Python jobs can run in the worker environment. The API and each worker mount the same `./uploads` directory so the file uploaded to the API is available to the worker when it later executes the script.
+The worker services are intentionally built from a dedicated `Dockerfile.worker` image that installs `python3` for uploaded Python jobs; its Node.js base image also provides Node.js for uploaded Node.js jobs. The API and each worker mount the same `./uploads` directory so the file uploaded to the API is available to the worker when it later executes the script.
 
-The three Compose worker services are `worker-1`, `worker-2`, and `worker-3`; their container names are `flow-worker-1`, `flow-worker-2`, and `flow-worker-3`. All run `node dist/worker.js`, connect to the same Redis queue and PostgreSQL database, and send independent heartbeats. Each has BullMQ concurrency set to 3.
+The three Compose worker services are `worker-1`, `worker-2`, and `worker-3`; their container names are `flow-worker-1`, `flow-worker-2`, and `flow-worker-3`. All run `node dist/worker/worker.js`, connect to the same Redis queue and PostgreSQL database, and send independent heartbeats. Each has BullMQ concurrency set to 3.
 
 Initialize the schema once before using the API. With the Compose PostgreSQL port published locally and `DATABASE_URL` pointing to `localhost:5432`, run:
 
@@ -644,6 +645,8 @@ Install dependencies:
 npm install
 ```
 
+For local development, have PostgreSQL and Redis running and set `DATABASE_URL` and `REDIS_URL` in `.env` before starting the API, scheduler, worker, or monitor.
+
 Initialize the PostgreSQL schema:
 
 ```bash
@@ -656,24 +659,24 @@ Start the API in watch mode:
 npm run dev
 ```
 
-Start the scheduler:
+Start the scheduler in watch mode:
 
 ```bash
-npm run scheduler
+npm run dev:scheduler
 ```
 
-Start one worker process for local development:
+Start one worker process in watch mode:
 
 ```bash
-npm run worker
+npm run dev:worker
 ```
 
 To run the full Docker deployment with all three workers instead, use `docker compose up -d --build` as above. Do not also start local worker processes unless additional consumers are intended.
 
-Start the monitor:
+Start the monitor in watch mode:
 
 ```bash
-npm run monitor
+npm run dev:monitor
 ```
 
 Build production JS:
@@ -686,6 +689,14 @@ Run the compiled API server:
 
 ```bash
 npm start
+```
+
+Run the compiled scheduler, one worker, or the monitor:
+
+```bash
+npm run start:scheduler
+npm run start:worker
+npm run start:monitor
 ```
 
 ## Environment variables
@@ -727,15 +738,15 @@ The scheduler runs a `setInterval` every 5 seconds and checks for ready jobs. Th
 
 Compose defines three independent worker services, each running the same worker implementation with `concurrency: 3`. Together they can process up to nine jobs at a time when enough work is queued and system resources are available. This demonstrates concurrent queue consumption without introducing autoscaling or per-job resource quotas.
 
-### Process-level command execution
+### Process-level command and script execution
 
-The actual task command is executed with Node's `child_process.spawn()`. Command jobs run with `shell: true`, while file jobs run as a Python subprocess with `shell: false`. In Docker, the worker image installs Python explicitly via `Dockerfile.worker`, and all services share the same `./uploads` mount so uploaded files remain accessible to the executing worker. This is simple and direct, but it is also a trust boundary. The implementation is intentionally not hardened against arbitrary command injection or untrusted job definitions.
+The actual task is executed with Node's `child_process.spawn()`. Command jobs run with `shell: true`, while uploaded Python and Node.js files run with `shell: false` using `python3` or `node`. Both execution paths use a fixed 30-second timeout. In Docker, the worker image installs Python explicitly via `Dockerfile.worker`, and the API and workers share the same `./uploads` mount so uploaded files remain accessible to the executing worker. This is simple and direct, but it is also a trust boundary. The implementation is intentionally not hardened against arbitrary command injection or untrusted job definitions.
 
 ## Failure scenarios and current handling
 
 ### Job fails once
 
-The worker catches the command failure, writes to `job_logs`, marks the job as `QUEUED` if retries remain, and rethrows the error so BullMQ can handle the retry.
+The worker records the failed attempt and latest error, then rethrows the error so BullMQ can handle the retry. During the backoff the database row is not reset to `QUEUED`; the next attempt marks it `RUNNING`, while exhausting BullMQ attempts marks it `FAILED`.
 
 ### Worker crashes mid-job
 
@@ -759,7 +770,7 @@ The current codebase is a solid foundation, but several production-grade improve
 
 - stronger job idempotency and deduplication keys
 - result payload storage for completed work
-- explicit job timeout and cancellation of stuck shell commands
+- configurable timeouts and explicit cancellation of active shell/script subprocesses (the current executor timeout is fixed at 30 seconds)
 - dead-letter queue handling for permanently failed jobs
 - richer job dependency and fan-out orchestration
 - queue rate limits / concurrency quotas per job type
@@ -788,7 +799,7 @@ docker compose up -d --build
 npm run db:init
 ```
 
-This starts the API, scheduler, monitor, and all three workers in Compose. For local development, `npm run dev`, `npm run scheduler`, `npm run worker`, and `npm run monitor` are separate commands/processes; `npm run worker` starts one worker instance only.
+This starts the API, scheduler, monitor, and all three workers in Compose. For local development, `npm run dev`, `npm run dev:scheduler`, `npm run dev:worker`, and `npm run dev:monitor` are separate commands/processes; `npm run dev:worker` starts one worker instance only.
 
 Then interact with the API at `http://localhost:8000`.
 

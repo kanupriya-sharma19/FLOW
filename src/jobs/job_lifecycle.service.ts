@@ -78,9 +78,6 @@ export const handleJobSuccess = async (job: Job) => {
 // ==================================================
 // HANDLE FAILURE
 // ==================================================
-// ==================================================
-// HANDLE FAILURE
-// ==================================================
 
 export const handleJobFailure = async (job: Job, error: unknown) => {
   const message =

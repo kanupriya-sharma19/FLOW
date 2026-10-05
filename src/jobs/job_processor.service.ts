@@ -1,9 +1,6 @@
-import { spawn } from "child_process";
 import dotenv from "dotenv";
 
-import { pool } from "../db.js";
 import { workerId } from "../worker/worker_heartbeat.service.js";
-import { calculateNextRun } from "./job_cron.service.js";
 import {
   createJobExecution,
   completeJobExecution,

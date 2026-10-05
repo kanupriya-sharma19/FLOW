@@ -16,7 +16,7 @@
   "start:worker": "node dist/worker/worker.js",
   "start:monitor": "node dist/worker/monitor.js",
 
-  "db:init": "tsx src/init-db.ts"
+  "db:init": "tsx src/init_db.ts"
   },
   "type": "module",
   "keywords": [],
