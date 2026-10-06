@@ -31,15 +31,16 @@ const formatTimestamp = (timestamp: string | null) => {
   });
 };
 
-const eventStyles: Record<string, { className: string; Icon: typeof Clock3 }> = {
-  CREATED: { className: "timeline-created", Icon: FilePlus2 },
-  QUEUED: { className: "timeline-queued", Icon: Clock3 },
-  WORKER_ASSIGNED: { className: "timeline-assigned", Icon: UserCheck },
-  STARTED: { className: "timeline-started", Icon: Play },
-  COMPLETED: { className: "timeline-completed", Icon: CheckCircle2 },
-  FAILED: { className: "timeline-failed", Icon: CircleAlert },
-  CANCELLED: { className: "timeline-cancelled", Icon: XCircle },
-};
+const eventStyles: Record<string, { className: string; Icon: typeof Clock3 }> =
+  {
+    CREATED: { className: "timeline-created", Icon: FilePlus2 },
+    QUEUED: { className: "timeline-queued", Icon: Clock3 },
+    WORKER_ASSIGNED: { className: "timeline-assigned", Icon: UserCheck },
+    STARTED: { className: "timeline-started", Icon: Play },
+    COMPLETED: { className: "timeline-completed", Icon: CheckCircle2 },
+    FAILED: { className: "timeline-failed", Icon: CircleAlert },
+    CANCELLED: { className: "timeline-cancelled", Icon: XCircle },
+  };
 
 const executionStatusClass: Record<string, string> = {
   PENDING: "status-pending",
@@ -107,11 +108,13 @@ const JobDetails = () => {
 
   const handleCancel = async () => {
     if (!id) return;
+
     setActionError(null);
     setActionLoading(true);
+
     try {
-      const updatedJob = await cancelJob(id);
-      setJob(updatedJob);
+      await cancelJob(id);
+      navigate("/");
     } catch (cancelError) {
       console.error(cancelError);
       setActionError("Failed to cancel this job.");
@@ -122,14 +125,18 @@ const JobDetails = () => {
 
   const handleDelete = async () => {
     if (!id) return;
-    const confirmed = window.confirm("Are you sure you want to delete this job?");
+
+    const confirmed = window.confirm(
+      "Are you sure you want to delete this job?",
+    );
     if (!confirmed) return;
 
     setActionError(null);
     setActionLoading(true);
+
     try {
       await deleteJob(id);
-      navigate("/jobs");
+      navigate("/");
     } catch (deleteError) {
       console.error(deleteError);
       setActionError("Failed to delete this job.");
@@ -145,7 +152,11 @@ const JobDetails = () => {
       <div className="surface">
         <div className="feedback-state">
           <div className="feedback-error">{error || "Job not found."}</div>
-          <button className="button" onClick={() => navigate("/jobs")} style={{ marginTop: 14 }}>
+          <button
+            className="button"
+            onClick={() => navigate("/")}
+            style={{ marginTop: 14 }}
+          >
             <ArrowLeft size={14} /> Back to jobs
           </button>
         </div>
@@ -155,7 +166,11 @@ const JobDetails = () => {
 
   return (
     <>
-      <button className="detail-back" onClick={() => navigate("/jobs")} type="button">
+      <button
+        className="detail-back"
+        onClick={() => navigate("/")}
+        type="button"
+      >
         <ArrowLeft size={15} /> Back to jobs
       </button>
 
@@ -166,7 +181,9 @@ const JobDetails = () => {
             <JobStatusBadge status={job.status} />
           </div>
           <div className="detail-meta-line">
-            <span>{job.job_type === "COMMAND" ? "Command job" : "File job"}</span>
+            <span>
+              {job.job_type === "COMMAND" ? "Command job" : "File job"}
+            </span>
             <span>Created {formatTimestamp(job.created_at)}</span>
             {job.worker_id && <span>Worker {job.worker_id}</span>}
           </div>
@@ -194,7 +211,11 @@ const JobDetails = () => {
       </div>
 
       {actionError && (
-        <div className="feedback-error" role="alert" style={{ marginBottom: 15 }}>
+        <div
+          className="feedback-error"
+          role="alert"
+          style={{ marginBottom: 15 }}
+        >
           {actionError}
         </div>
       )}
@@ -205,20 +226,37 @@ const JobDetails = () => {
             <div className="panel-header">
               <div>
                 <h2 className="section-title">Overview</h2>
-                <p className="section-subtitle">Configuration and lifecycle metadata</p>
+                <p className="section-subtitle">
+                  Configuration and lifecycle metadata
+                </p>
               </div>
             </div>
             <div className="panel-body">
               <div className="metadata-grid">
                 <Metadata label="Type" value={job.job_type} />
                 <Metadata label="Schedule" value={job.schedule_type} />
-                <Metadata label="Scheduled for" value={scheduleDescription(job)} />
+                <Metadata
+                  label="Scheduled for"
+                  value={scheduleDescription(job)}
+                />
                 <Metadata label="Runtime" value={job.runtime || "—"} />
                 <Metadata label="Priority" value={String(job.priority)} />
-                <Metadata label="Attempts" value={`${job.attempts} / ${job.max_attempts}`} />
-                <Metadata label="Created" value={formatTimestamp(job.created_at)} />
-                <Metadata label="Started" value={formatTimestamp(job.started_at)} />
-                <Metadata label="Completed" value={formatTimestamp(job.completed_at)} />
+                <Metadata
+                  label="Attempts"
+                  value={`${job.attempts} / ${job.max_attempts}`}
+                />
+                <Metadata
+                  label="Created"
+                  value={formatTimestamp(job.created_at)}
+                />
+                <Metadata
+                  label="Started"
+                  value={formatTimestamp(job.started_at)}
+                />
+                <Metadata
+                  label="Completed"
+                  value={formatTimestamp(job.completed_at)}
+                />
               </div>
             </div>
           </section>
@@ -227,7 +265,9 @@ const JobDetails = () => {
             <section className="surface">
               <div className="panel-header">
                 <div>
-                  <h2 className="section-title">{job.command ? "Command" : "File"}</h2>
+                  <h2 className="section-title">
+                    {job.command ? "Command" : "File"}
+                  </h2>
                   <p className="section-subtitle">Execution source</p>
                 </div>
               </div>
@@ -242,7 +282,8 @@ const JobDetails = () => {
               <div>
                 <h2 className="section-title">Execution history</h2>
                 <p className="section-subtitle">
-                  {executions.length} {executions.length === 1 ? "attempt" : "attempts"} recorded
+                  {executions.length}{" "}
+                  {executions.length === 1 ? "attempt" : "attempts"} recorded
                 </p>
               </div>
             </div>
@@ -252,7 +293,10 @@ const JobDetails = () => {
               ) : (
                 <div className="attempt-list">
                   {executions.map((execution) => (
-                    <ExecutionAttempt key={execution.id} execution={execution} />
+                    <ExecutionAttempt
+                      key={execution.id}
+                      execution={execution}
+                    />
                   ))}
                 </div>
               )}
@@ -290,7 +334,9 @@ const JobDetails = () => {
                           {log.event.replaceAll("_", " ")}
                         </div>
                         {log.message && (
-                          <div className="timeline-description">{log.message}</div>
+                          <div className="timeline-description">
+                            {log.message}
+                          </div>
                         )}
                         <div className="timeline-time">
                           {formatTimestamp(log.created_at)}
@@ -324,7 +370,9 @@ const ExecutionAttempt = ({ execution }: { execution: JobExecution }) => {
       <div className="attempt-header">
         <div>
           <div className="attempt-name">Attempt {execution.attempt}</div>
-          <div className="attempt-worker">Worker: {execution.worker_id || "Unknown"}</div>
+          <div className="attempt-worker">
+            Worker: {execution.worker_id || "Unknown"}
+          </div>
         </div>
         <span className={`status-badge ${statusClass}`}>
           <span className="status-dot" aria-hidden="true" />
@@ -333,14 +381,24 @@ const ExecutionAttempt = ({ execution }: { execution: JobExecution }) => {
       </div>
       <div className="attempt-content">
         <div className="attempt-meta">
-          <Metadata label="Started" value={formatTimestamp(execution.started_at)} />
-          <Metadata label="Completed" value={formatTimestamp(execution.completed_at)} />
+          <Metadata
+            label="Started"
+            value={formatTimestamp(execution.started_at)}
+          />
+          <Metadata
+            label="Completed"
+            value={formatTimestamp(execution.completed_at)}
+          />
           <Metadata
             label="Exit code"
-            value={execution.exit_code === null ? "—" : String(execution.exit_code)}
+            value={
+              execution.exit_code === null ? "—" : String(execution.exit_code)
+            }
           />
         </div>
-        {execution.error && <div className="output-error">{execution.error}</div>}
+        {execution.error && (
+          <div className="output-error">{execution.error}</div>
+        )}
         {execution.stdout && (
           <div>
             <p className="output-label">stdout</p>

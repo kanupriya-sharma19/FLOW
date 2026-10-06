@@ -107,9 +107,6 @@ const JobForm = ({ onSuccess, onCancel }: JobFormProps) => {
         <section className="form-section">
           <div>
             <h3 className="form-section-title">Job configuration</h3>
-            <p className="form-section-description">
-              Define the task and its executable source.
-            </p>
           </div>
 
           <label className="form-field">
@@ -187,9 +184,6 @@ const JobForm = ({ onSuccess, onCancel }: JobFormProps) => {
         <section className="form-section">
           <div>
             <h3 className="form-section-title">Scheduling</h3>
-            <p className="form-section-description">
-              Run immediately, at a specific time, or on a recurring schedule.
-            </p>
           </div>
 
           <div className="segmented-control" role="group" aria-label="Schedule type">
@@ -243,9 +237,6 @@ const JobForm = ({ onSuccess, onCancel }: JobFormProps) => {
         <section className="form-section">
           <div>
             <h3 className="form-section-title">Execution policy</h3>
-            <p className="form-section-description">
-              Set the queue priority and retry limit for this job.
-            </p>
           </div>
           <div className="form-grid">
             <label className="form-field">

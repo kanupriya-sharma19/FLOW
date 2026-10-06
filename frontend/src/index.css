@@ -1062,15 +1062,19 @@ textarea.field-control {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+  width: 100%;
 }
 
 .segment-button {
+  flex: 1 1 0;
+  min-width: 0;
   min-height: 34px;
   border: 1px solid #e0e4e9;
   border-radius: 6px;
   background: #fff;
   color: #626c79;
   font-size: 12px;
+  text-align: center;
   padding: 0 11px;
   transition:
     border-color 130ms ease,
