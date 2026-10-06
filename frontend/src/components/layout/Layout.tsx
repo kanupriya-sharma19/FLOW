@@ -3,10 +3,9 @@ import Header from "./Header";
 
 const Layout = () => {
   return (
-    <div className="min-h-screen bg-gray-50">
+    <div className="app-shell">
       <Header />
-
-      <main className="mx-auto max-w-7xl px-8 py-8">
+      <main className="main-content">
         <Outlet />
       </main>
     </div>
