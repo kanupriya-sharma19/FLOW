@@ -9,7 +9,27 @@ import {
 } from "../services/api";
 import JobStatusBadge from "../components/jobs/JobStatusBadge";
 import type { Job, JobExecution, JobLog } from "../types/job";
-import { ArrowLeft, Trash2, XCircle } from "lucide-react";
+import {
+  ArrowLeft,
+  Trash2,
+  XCircle,
+  CheckCircle2,
+  CircleAlert,
+  Clock3,
+  Play,
+  UserCheck,
+  FilePlus2,
+} from "lucide-react";
+
+const formatTimestamp = (timestamp: string | null) => {
+  if (!timestamp) return "—";
+
+  return new Date(timestamp).toLocaleString("en-IN", {
+    timeZone: "Asia/Kolkata",
+    dateStyle: "medium",
+    timeStyle: "medium",
+  });
+};
 
 const JobDetails = () => {
   const { id } = useParams();
@@ -114,7 +134,7 @@ const JobDetails = () => {
           Back to Jobs
         </button>
 
-        {["PENDING", "QUEUED", "RUNNING"].includes(job.status) && (
+        {["PENDING", "QUEUED"].includes(job.status) && (
           <button
             onClick={handleCancel}
             className="flex items-center gap-2 rounded-lg border border-red-200 px-3 py-2 text-sm font-medium text-red-600 hover:bg-red-50"
@@ -206,12 +226,12 @@ const JobDetails = () => {
                 <div className="mt-3 grid grid-cols-2 gap-4 text-sm">
                   <div>
                     <p className="text-gray-500">Started</p>
-                    <p>{execution.started_at || "—"}</p>
+                    <p>{formatTimestamp(execution.started_at)}</p>
                   </div>
 
                   <div>
                     <p className="text-gray-500">Completed</p>
-                    <p>{execution.completed_at || "—"}</p>
+                    <p>{formatTimestamp(execution.completed_at)}</p>
                   </div>
 
                   <div>
@@ -247,31 +267,109 @@ const JobDetails = () => {
           </div>
         )}
       </div>
-
       <div className="mt-6 rounded-xl border bg-white p-6">
-        <h2 className="mb-4 text-lg font-semibold">Activity</h2>
+        <div className="mb-6">
+          <h2 className="text-lg font-semibold">Activity</h2>
+          <p className="mt-1 text-sm text-gray-500">
+            Job lifecycle and execution events
+          </p>
+        </div>
 
         {logs.length === 0 ? (
           <p className="text-sm text-gray-500">No activity yet.</p>
         ) : (
-          <div className="space-y-4">
-            {logs.map((log) => (
-              <div key={log.id} className="flex gap-4">
-                <div className="mt-1 h-2 w-2 shrink-0 rounded-full bg-gray-400" />
+          <div>
+            {logs.map((log, index) => {
+              const isLast = index === logs.length - 1;
 
-                <div>
-                  <p className="text-sm font-medium">{log.event}</p>
+              const eventConfig: Record<
+                string,
+                {
+                  color: string;
+                  bg: string;
+                  icon: React.ReactNode;
+                }
+              > = {
+                CREATED: {
+                  color: "text-gray-600",
+                  bg: "bg-gray-100",
+                  icon: <FilePlus2 size={15} />,
+                },
+                QUEUED: {
+                  color: "text-yellow-600",
+                  bg: "bg-yellow-100",
+                  icon: <Clock3 size={15} />,
+                },
+                WORKER_ASSIGNED: {
+                  color: "text-purple-600",
+                  bg: "bg-purple-100",
+                  icon: <UserCheck size={15} />,
+                },
+                STARTED: {
+                  color: "text-blue-600",
+                  bg: "bg-blue-100",
+                  icon: <Play size={15} />,
+                },
+                COMPLETED: {
+                  color: "text-green-600",
+                  bg: "bg-green-100",
+                  icon: <CheckCircle2 size={15} />,
+                },
+                FAILED: {
+                  color: "text-red-600",
+                  bg: "bg-red-100",
+                  icon: <CircleAlert size={15} />,
+                },
+                CANCELLED: {
+                  color: "text-gray-500",
+                  bg: "bg-gray-100",
+                  icon: <XCircle size={15} />,
+                },
+              };
 
-                  {log.message && (
-                    <p className="mt-1 text-sm text-gray-500">{log.message}</p>
+              const config = eventConfig[log.event] ?? {
+                color: "text-gray-600",
+                bg: "bg-gray-100",
+                icon: <Clock3 size={15} />,
+              };
+
+              return (
+                <div key={log.id} className="relative flex gap-4">
+                  {/* Connecting line */}
+                  {!isLast && (
+                    <div className="absolute left-5 top-10 bottom-0 w-px bg-gray-200" />
                   )}
 
-                  <p className="mt-1 text-xs text-gray-400">
-                    {new Date(log.created_at).toLocaleString()}
-                  </p>
+                  {/* Event icon */}
+                  <div
+                    className={`relative z-10 flex h-10 w-10 shrink-0 items-center justify-center rounded-full ${config.bg} ${config.color}`}
+                  >
+                    {config.icon}
+                  </div>
+
+                  {/* Event content */}
+                  <div className={`flex-1 ${isLast ? "" : "pb-7"}`}>
+                    <div className="flex items-start justify-between gap-4">
+                      <div>
+                        <p className={`text-sm font-semibold ${config.color}`}>
+                          {log.event}
+                        </p>
+
+                        {log.message && (
+                          <p className="mt-1 text-sm leading-5 text-gray-600">
+                            {log.message}
+                          </p>
+                        )}
+                      </div>
+
+                      <span className="shrink-0 text-xs text-gray-400">
+                        {formatTimestamp(log.created_at)}
+                      </span>
+                    </div>
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>

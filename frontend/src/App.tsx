@@ -4,7 +4,6 @@ import Layout from "./components/layout/Layout";
 import Dashboard from "./pages/Dashboard";
 import Jobs from "./pages/Jobs";
 import JobDetails from "./pages/JobDetails";
-import Workers from "./pages/Workers";
 
 function App() {
   return (
@@ -14,7 +13,6 @@ function App() {
           <Route path="/" element={<Dashboard />} />
           <Route path="/jobs" element={<Jobs />} />
           <Route path="/jobs/:id" element={<JobDetails />} />
-          <Route path="/workers" element={<Workers />} />
         </Route>
       </Routes>
     </BrowserRouter>

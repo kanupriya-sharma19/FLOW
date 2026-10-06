@@ -1,6 +1,6 @@
 ﻿# FLOW
 
-FLOW is a distributed job scheduling and execution platform built with Node.js, TypeScript, PostgreSQL, Redis, and BullMQ. It is designed around a simple but practical idea: store job intent in PostgreSQL as the durable source of truth, enqueue execution work through BullMQ/Redis, and have three independent worker containers perform the actual work outside the web API.
+FLOW is a distributed job scheduling and execution platform built with Node.js, TypeScript, PostgreSQL, Redis, BullMQ, React, and Vite. It is designed around a simple but practical idea: store job intent in PostgreSQL as the durable source of truth, enqueue execution work through BullMQ/Redis, and have three independent worker containers perform the actual work outside the web API. A web dashboard provides job creation, status summaries, and job activity/history views.
 
 This repository is not just a toy scheduler. It implements a concrete system in which jobs can be created through HTTP, scheduled for immediate, one-time, or recurring execution, submitted as shell commands or uploaded Python/Node.js scripts, queued for worker consumption, retried on failure, monitored for worker liveness, and recovered if a worker dies mid-execution.
 
@@ -37,12 +37,16 @@ The current codebase already includes:
 - Recurring job next-run scheduling based on cron expressions
 - Crash recovery for jobs assigned to dead workers
 - Job logs for lifecycle events
+- React dashboard for job totals, recent jobs, and online worker count
+- Web UI for creating, filtering, and inspecting jobs, including execution history and activity logs
+- Worker listing endpoint (`GET /workers`) used by the dashboard
 
 ## High-level architecture
 
 ```mermaid
 flowchart LR
     Client[Client / API Consumer] --> API[Express API\nPOST /jobs\nGET /jobs\nPATCH /jobs/:id]
+    Browser[React + Vite frontend] --> API
     API --> PG[(PostgreSQL\njobs, job_logs, workers, job_executions)]
     Scheduler --> PG
     Scheduler --> Queue[Redis + BullMQ\nflow-jobs]
@@ -72,6 +76,7 @@ The architecture intentionally separates responsibilities:
 | Component | Role | Why it exists |
 |---|---|---|
 | API server | Express app and REST endpoints | Accepts job creation and management requests without doing execution work directly |
+| Frontend | React + Vite dashboard | Presents job summaries, job management, worker count, execution history, and lifecycle activity |
 | PostgreSQL | Source of truth for jobs, logs, workers, and execution attempts | Keeps state durable, queryable, and auditable |
 | Scheduler | Polls pending jobs and enqueues them | Moves jobs from database state to BullMQ queue |
 | BullMQ + Redis | Queue, retry, and concurrency coordination | Decouples producers from consumers and provides job distribution |
@@ -80,7 +85,7 @@ The architecture intentionally separates responsibilities:
 
 ## Database and state model
 
-The project initializes PostgreSQL tables in `src/init_db.ts`. The important tables are:
+The project initializes PostgreSQL tables in `backend/src/init_db.ts`. The important tables are:
 
 - `jobs`: current job state, including `job_type`, `file_path`, and `runtime` for uploaded file jobs
 - `job_logs`: event history for each job
@@ -170,11 +175,11 @@ The `jobs` table stores:
 
 `job_logs` records the lifecycle events of each job, such as `CREATED`, `QUEUED`, `WORKER_ASSIGNED`, `STARTED`, `COMPLETED`, `FAILED`, and `CANCELLED`.
 
-`job_executions` keeps per-attempt history separately from the current `jobs` row. The worker inserts a `RUNNING` record when it starts an attempt and updates that record to `COMPLETED` or `FAILED` with its completion timestamp, exit code, stdout, stderr, and error text. The table is created, with indexes on `job_id` and `worker_id`, by `npm run db:init`. There is no API endpoint for querying execution records.
+`job_executions` keeps per-attempt history separately from the current `jobs` row. The worker inserts a `RUNNING` record when it starts an attempt and updates that record to `COMPLETED` or `FAILED` with its completion timestamp, exit code, stdout, stderr, and error text. The table is created, with indexes on `job_id` and `worker_id`, by `npm run db:init` from `backend/`. The API exposes per-job execution history and logs through the endpoints below.
 
 ## API and request flow
 
-The API is mounted in `src/app.ts` and all job routes are defined in `src/routes/job.routes.ts`.
+The API is mounted in `backend/src/app.ts`; job routes are defined in `backend/src/routes/job.routes.ts` and worker routes in `backend/src/routes/workers.routes.ts`.
 
 ### Health
 
@@ -201,8 +206,17 @@ Response:
 | `GET` | `/jobs/:id` | Get one job |
 | `PATCH` | `/jobs/:id` | Update name, command, priority, maxAttempts |
 | `DELETE` | `/jobs/:id` | Delete a job row |
-| `POST` | `/jobs/:id/cancel` | Cancel `PENDING` or `QUEUED` jobs |
+| `POST` | `/jobs/:id/cancel` | Cancel `PENDING`, `QUEUED`, or `RUNNING` jobs |
+| `GET` | `/jobs/:id/executions` | List per-attempt execution history |
+| `GET` | `/jobs/:id/logs` | List job lifecycle logs |
 | `POST` | `/jobs/queue` | Trigger scheduler-style queueing immediately |
+| `GET` | `/workers` | List workers ordered by most recent heartbeat |
+
+### Web dashboard
+
+The React frontend is in `frontend/` and is served by Vite during development. Its current routes are `/` (dashboard), `/jobs` (searchable and status-filtered job list with job creation), and `/jobs/:id` (job details, execution attempts, and activity logs). The dashboard shows total, running, completed, and failed job counts, the online worker count, and the five most recent jobs. The UI currently offers cancellation for `PENDING` and `QUEUED` jobs; the API also accepts `RUNNING` jobs. Marking a running job cancelled does not terminate its already-running operating-system process.
+
+The frontend API client currently targets `http://localhost:8000`, so run the API on that address when using the development server.
 
 ### Example job creation
 
@@ -342,7 +356,7 @@ sequenceDiagram
 
 ## Scheduler and queue flow
 
-The scheduler process runs `src/scheduler/scheduler.ts`, which calls `startScheduler()` from `src/scheduler/scheduler.service.ts`.
+The scheduler process runs `backend/src/scheduler/scheduler.ts`, which calls `startScheduler()` from `backend/src/scheduler/scheduler.service.ts`.
 
 It polls every 5 seconds and applies this logic:
 
@@ -362,7 +376,7 @@ After the job is selected for queueing, the scheduler adds a BullMQ job to the `
 
 ### Queue implementation
 
-`src/queues/job.queue.ts` creates:
+`backend/src/queues/job.queue.ts` creates:
 
 ```ts
 export const connection = new Redis(process.env.REDIS_URL || "redis://localhost:6379", {
@@ -437,7 +451,7 @@ flowchart TD
 
 The retry logic is split between PostgreSQL execution history and BullMQ behavior. On failure, `handleJobFailure()` stores the error and clears the worker assignment, then rethrows; it does not set the database job back to `QUEUED` between retries. BullMQ schedules the retry, and the next worker attempt marks the database job `RUNNING` again.
 
-When a command or uploaded script fails in `src/jobs/job_processor.service.ts`, the worker updates that attempt's `job_executions` record with the error, captured output, and exit code when available, records the failure in `job_logs`, stores the latest error on the job, and re-throws the error so BullMQ can apply its retry policy. Non-zero exits, spawn errors, and execution timeouts all follow this path.
+When a command or uploaded script fails in `backend/src/jobs/job_processor.service.ts`, the worker updates that attempt's `job_executions` record with the error, captured output, and exit code when available, records the failure in `job_logs`, stores the latest error on the job, and re-throws the error so BullMQ can apply its retry policy. Non-zero exits, spawn errors, and execution timeouts all follow this path. The worker also refuses to mark a job `RUNNING` once its database attempt count has reached `max_attempts`.
 
 BullMQ is configured with:
 
@@ -466,7 +480,7 @@ flowchart LR
 
 ## Worker execution model
 
-Worker startup is in `src/worker/worker.ts`; it calls `startWorker()` from `src/worker/worker.service.ts`. Each worker starts a BullMQ `Worker` with concurrency set to 3:
+Worker startup is in `backend/src/worker/worker.ts`; it calls `startWorker()` from `backend/src/worker/worker.service.ts`. Each worker starts a BullMQ `Worker` with concurrency set to 3:
 
 ```ts
 const worker = new Worker(
@@ -483,7 +497,7 @@ const worker = new Worker(
 );
 ```
 
-The Docker Compose deployment runs three independent worker containers—`flow-worker-1`, `flow-worker-2`, and `flow-worker-3`—each executing the same `src/worker/worker.ts` entry point and consuming the shared `flow-jobs` queue. Each worker process has `concurrency: 3`, so the three configured workers can collectively run up to nine jobs concurrently, subject to available resources and queued work. The workers are separate processes, not a single worker instance replicated internally.
+The Docker Compose deployment runs three independent worker containers—`flow-worker-1`, `flow-worker-2`, and `flow-worker-3`—each executing the same `backend/src/worker/worker.ts` entry point and consuming the shared `flow-jobs` queue. Each worker process has `concurrency: 3`, so the three configured workers can collectively run up to nine jobs concurrently, subject to available resources and queued work. The workers are separate processes, not a single worker instance replicated internally.
 
 Running `npm run dev:worker` locally starts one worker process. It does not start all three Compose workers.
 
@@ -524,7 +538,7 @@ export const startHeartbeat = () => {
 };
 ```
 
-The single monitor process runs separately via `src/worker/monitor.ts` and `src/worker/worker_monitor.service.ts`. It checks all worker records and marks any worker offline if that worker fails to heartbeat within 15 seconds. When one of the three workers is marked offline, it inspects jobs recorded as running under that worker ID and uses BullMQ state to decide whether recovery is needed.
+The single monitor process runs separately via `backend/src/worker/monitor.ts` and `backend/src/worker/worker_monitor.service.ts`. It checks all worker records and marks any worker offline if that worker fails to heartbeat within 15 seconds. When one of the three workers is marked offline, it inspects jobs recorded as running under that worker ID and uses BullMQ state to decide whether recovery is needed.
 
 ```mermaid
 flowchart TD
@@ -560,53 +574,42 @@ The `jobs` row remains the durable current state machine. For example:
 - `RUNNING` means a worker claimed it and is executing the command or uploaded script
 - `COMPLETED` means execution succeeded
 - `FAILED` means maximum retry attempts were exhausted
-- `CANCELLED` means the job was cancelled before execution or while still waiting in the queue
+- `CANCELLED` means cancellation was recorded; cancelling an already-running job does not terminate its operating-system process
 
 ## Project structure
 
 ```text
 FLOW/
-├── Dockerfile
-├── Dockerfile.worker
-├── docker-compose.yml
-├── .env
-├── package.json
-├── tsconfig.json
-├── src/
-│   ├── app.ts
-│   ├── db.ts
-│   ├── init_db.ts
-│   ├── server.ts
-│   ├── controllers/
-│   │   └── job.controller.ts
-│   ├── executors/
-│   │   ├── command.executor.ts
-│   │   └── script.executor.ts
-│   ├── jobs/
-│   │   ├── job_cron.service.ts
-│   │   ├── job_execution.service.ts
-│   │   ├── job_lifecycle.service.ts
-│   │   ├── job_log.service.ts
-│   │   ├── job_processor.service.ts
-│   │   └── job_query.service.ts
-│   ├── queues/
-│   │   └── job.queue.ts
-│   ├── routes/
-│   │   └── job.routes.ts
-│   ├── scheduler/
-│   │   ├── scheduler.service.ts
-│   │   └── scheduler.ts
-│   ├── types/
-│   │   └── job.types.ts
-│   └── worker/
-│       ├── monitor.ts
-│       ├── worker.service.ts
-│       ├── worker.ts
-│       ├── worker_heartbeat.service.ts
-│       └── worker_monitor.service.ts
-├── dist/
-├── node_modules/
-├── package-lock.json
+├── backend/
+│   ├── Dockerfile
+│   ├── Dockerfile.worker
+│   ├── docker-compose.yml
+│   ├── package.json
+│   ├── tsconfig.json
+│   └── src/
+│       ├── app.ts
+│       ├── db.ts
+│       ├── init_db.ts
+│       ├── server.ts
+│       ├── controllers/
+│       │   ├── job.controller.ts
+│       │   └── workers.controller.ts
+│       ├── executors/
+│       │   ├── command.executor.ts
+│       │   └── script.executor.ts
+│       ├── jobs/
+│       ├── queues/
+│       ├── routes/
+│       ├── scheduler/
+│       └── worker/
+├── frontend/
+│   ├── package.json
+│   └── src/
+│       ├── App.tsx
+│       ├── components/
+│       ├── hooks/
+│       ├── pages/
+│       └── services/api.ts
 └── README.md
 ```
 
@@ -615,7 +618,7 @@ FLOW/
 ### Start the infrastructure with Docker Compose
 
 ```bash
-docker compose up -d --build
+docker compose -f backend/docker-compose.yml up -d --build
 ```
 
 This starts:
@@ -631,21 +634,23 @@ The worker services are intentionally built from a dedicated `Dockerfile.worker`
 
 The three Compose worker services are `worker-1`, `worker-2`, and `worker-3`; their container names are `flow-worker-1`, `flow-worker-2`, and `flow-worker-3`. All run `node dist/worker/worker.js`, connect to the same Redis queue and PostgreSQL database, and send independent heartbeats. Each has BullMQ concurrency set to 3.
 
-Initialize the schema once before using the API. With the Compose PostgreSQL port published locally and `DATABASE_URL` pointing to `localhost:5432`, run:
+Initialize the schema once before using the API. With the Compose PostgreSQL port published locally and `DATABASE_URL` pointing to `localhost:5432`, run this from the repository root:
 
 ```bash
+cd backend
 npm run db:init
 ```
 
 ### Local development commands
 
-Install dependencies:
+Run backend commands from `backend/`. Install dependencies:
 
 ```bash
+cd backend
 npm install
 ```
 
-For local development, have PostgreSQL and Redis running and set `DATABASE_URL` and `REDIS_URL` in `.env` before starting the API, scheduler, worker, or monitor.
+For local development, have PostgreSQL and Redis running and set `DATABASE_URL` and `REDIS_URL` in `backend/.env` before starting the API, scheduler, worker, or monitor.
 
 Initialize the PostgreSQL schema:
 
@@ -671,7 +676,7 @@ Start one worker process in watch mode:
 npm run dev:worker
 ```
 
-To run the full Docker deployment with all three workers instead, use `docker compose up -d --build` as above. Do not also start local worker processes unless additional consumers are intended.
+To run the full backend Docker deployment with all three workers instead, use `docker compose -f backend/docker-compose.yml up -d --build` from the repository root. The Compose stack does not include the frontend; run its Vite development server separately. Do not also start local worker processes unless additional consumers are intended.
 
 Start the monitor in watch mode:
 
@@ -699,6 +704,18 @@ npm run start:worker
 npm run start:monitor
 ```
 
+### Frontend development commands
+
+The frontend calls the API at `http://localhost:8000`. Start the backend and its PostgreSQL/Redis dependencies first, then run these commands from `frontend/`:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+The Vite development server prints the local URL when it starts (normally `http://localhost:5173`). To check the frontend production build or lint it, run `npm run build` or `npm run lint` from `frontend/`.
+
 ## Environment variables
 
 The project relies on the following environment values:
@@ -710,7 +727,7 @@ The project relies on the following environment values:
 | `PORT` | API port | `8000` |
 | `WORKER_ID` | Optional explicit worker identity | Hostname + UUID suffix |
 
-The `.env` file used locally looks like this:
+The `backend/.env` file used locally looks like this:
 
 ```env
 DATABASE_URL="postgresql://flow:flow@localhost:5432/flow"
@@ -752,9 +769,9 @@ The worker records the failed attempt and latest error, then rethrows the error 
 
 The worker monitor checks heartbeats. If the worker stops heartbeating, the monitor marks it offline and inspects the jobs it was running. If BullMQ still owns the job, it leaves it alone; otherwise it requeues the job or marks it failed if retries are exhausted.
 
-### Job is cancelled while pending or queued
+### Job is cancelled
 
-`POST /jobs/:id/cancel` marks the PostgreSQL row as `CANCELLED` and removes the BullMQ job if it exists.
+`POST /jobs/:id/cancel` accepts `PENDING`, `QUEUED`, and `RUNNING` jobs, marks the PostgreSQL row as `CANCELLED`, and attempts to remove the BullMQ job if it exists. The web UI currently displays the cancel action only for `PENDING` and `QUEUED` jobs. Cancelling a `RUNNING` job does not terminate its already-running command or script process.
 
 ### Recurring job needs a new schedule
 
@@ -774,7 +791,7 @@ The current codebase is a solid foundation, but several production-grade improve
 - dead-letter queue handling for permanently failed jobs
 - richer job dependency and fan-out orchestration
 - queue rate limits / concurrency quotas per job type
-- dashboard or admin UI for jobs and worker health
+- richer dashboard and worker health views beyond the current summary counts and online-worker count
 - authentication, authorization, and role-based API access
 - multi-node deployment orchestration, container scheduling, and observability
 - retry policies that vary per job type instead of one fixed backoff configuration
@@ -795,11 +812,12 @@ It is intentionally simple, but it demonstrates the core building blocks of a se
 ## Running the system
 
 ```bash
-docker compose up -d --build
+docker compose -f backend/docker-compose.yml up -d --build
+cd backend
 npm run db:init
 ```
 
-This starts the API, scheduler, monitor, and all three workers in Compose. For local development, `npm run dev`, `npm run dev:scheduler`, `npm run dev:worker`, and `npm run dev:monitor` are separate commands/processes; `npm run dev:worker` starts one worker instance only.
+This starts the API, scheduler, monitor, and all three workers in Compose. Backend local-development commands run from `backend/`: `npm run dev`, `npm run dev:scheduler`, `npm run dev:worker`, and `npm run dev:monitor` are separate commands/processes; `npm run dev:worker` starts one worker instance only. Run the frontend separately from `frontend/` with `npm run dev`.
 
 Then interact with the API at `http://localhost:8000`.
 

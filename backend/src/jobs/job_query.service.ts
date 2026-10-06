@@ -43,7 +43,6 @@ export const checkIfCancelled = async (job: Job): Promise<boolean> => {
 // ==================================================
 // 3. MARK JOB AS RUNNING
 // ==================================================
-
 export const markJobAsRunning = async (job: Job) => {
   const result = await pool.query(
     `
@@ -55,10 +54,17 @@ export const markJobAsRunning = async (job: Job) => {
       worker_id = $2,
       updated_at = NOW()
     WHERE id = $1
+      AND attempts < max_attempts
     RETURNING *
     `,
     [job.id, workerId],
   );
+
+  if (result.rows.length === 0) {
+    throw new Error(
+      `Job ${job.id} has reached its maximum attempts`,
+    );
+  }
 
   return result.rows[0];
 };

@@ -24,6 +24,14 @@ export const useJobs = () => {
 
   useEffect(() => {
     fetchJobs();
+
+    const interval = setInterval(() => {
+      fetchJobs();
+    }, 5000);
+
+    return () => {
+      clearInterval(interval);
+    };
   }, []);
 
   return {

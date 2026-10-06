@@ -388,21 +388,12 @@ export const cancelJob = async (
         status = 'CANCELLED',
         updated_at = NOW()
       WHERE id = $1
-        AND status IN ('PENDING', 'QUEUED')
+        AND status IN ('PENDING', 'QUEUED', 'RUNNING')
       RETURNING *
       `,
       [id],
     );
 
-    await pool.query(
-      `
-      INSERT INTO job_logs (job_id, event, message)
-      VALUES ($1, $2, $3)
-      `,
-      [id, "CANCELLED", "Job cancelled by user"],
-    );
-
-    await addJobLog(id, "CANCELLED", `Job cancelled by user`);
 
     if (result.rows.length === 0) {
       const jobResult = await pool.query(
@@ -440,6 +431,8 @@ export const cancelJob = async (
 
       console.log(`Removed job ${id} from BullMQ`);
     }
+
+    await addJobLog(id, "CANCELLED", `Job cancelled by user`);
 
     // --------------------------------------------------
     // 3. Return cancelled job
