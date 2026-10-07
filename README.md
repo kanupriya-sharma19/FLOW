@@ -1,5 +1,13 @@
 ﻿# FLOW
+<div align="center">
+  <a href="https://youtu.be/1ULgqZ_3FVI" target="_blank" rel="noopener noreferrer">
+    <img src="https://img.youtube.com/vi/1ULgqZ_3FVI/maxresdefault.jpg" alt="Flow demo video" width="960" />
+  </a>
+</div>
 
+<p align="center">
+  <strong>Project demo:</strong> <a href="https://youtu.be/1ULgqZ_3FVI" target="_blank" rel="noopener noreferrer">Watch the Flow demo on YouTube</a>
+</p>
 FLOW is a distributed job scheduling and execution platform built with Node.js, TypeScript, PostgreSQL, Redis, BullMQ, React, and Vite. It is designed around a simple but practical idea: store job intent in PostgreSQL as the durable source of truth, enqueue execution work through BullMQ/Redis, and have three independent worker containers perform the actual work outside the web API. A web dashboard provides job creation, status summaries, and job activity/history views.
 
 This repository is not just a toy scheduler. It implements a concrete system in which jobs can be created through HTTP, scheduled for immediate, one-time, or recurring execution, submitted as shell commands or uploaded Python/Node.js scripts, queued for worker consumption, retried on failure, monitored for worker liveness, and recovered if a worker dies mid-execution.
